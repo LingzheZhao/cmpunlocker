@@ -46,14 +46,12 @@ expected_mib_for_profile() {
     esac
 }
 
-# Return 0 if mem_mib looks unlocked for the given profile.
 is_unlocked_memory() {
     local profile="$1"
     local mem_mib="$2"
     [[ "${mem_mib}" =~ ^[0-9]+$ ]] || return 1
     case "${profile}" in
         8gb)
-            # Unlocked ~64GB; also accept already-detected unlocked range from install
             (( mem_mib >= 60000 )) && return 0
             ;;
         10gb)
@@ -107,7 +105,6 @@ GPU_DEVIDS=()
 GPU_PROFILES=()
 GPU_EXPECTED=()
 
-# Prefer installed inventory; fall back to live lspci enumeration.
 if [[ -r "${INVENTORY_FILE}" ]] && [[ -s "${INVENTORY_FILE}" ]]; then
     info "Using inventory: ${INVENTORY_FILE}"
     while read -r bdf devid profile expected || [[ -n "${bdf:-}" ]]; do

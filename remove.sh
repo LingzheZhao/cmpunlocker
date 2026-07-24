@@ -33,7 +33,7 @@ echo ""
 
 if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     warn "This removes cmpunlocker patched kernel modules:"
-    echo "  - Stops leftover cmpunlocker systemd service (if present)"
+    echo "  - Stops cmpunlocker systemd service"
     echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Reloads stock NVIDIA modules (brief display interruption)"

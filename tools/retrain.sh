@@ -9,25 +9,21 @@ for i in $(seq 1 120); do
   sleep 1
 done
 if ! nvidia-smi -L &>/dev/null; then
-  echo "retrain: not ready; skip"
   exit 0
 fi
 
 mem="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)"
 if [[ -z "${mem}" || "${mem}" == "[N/A]" ]]; then
-  echo "retrain: memory not ready; skip"
   exit 0
 fi
 
 cur="$(nvidia-smi --query-gpu=pcie.link.gen.current --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
 if [[ "${cur}" == "2" ]]; then
-  echo "retrain: already Gen2; skip"
   exit 0
 fi
 
 max="$(nvidia-smi --query-gpu=pcie.link.gen.max --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
 if [[ "${max}" != "2" && "${max}" != "3" && "${max}" != "4" ]]; then
-  echo "retrain: Device Max=${max}; skip"
   exit 0
 fi
 

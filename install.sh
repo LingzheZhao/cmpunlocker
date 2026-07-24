@@ -119,7 +119,6 @@ if command -v nvidia-smi &>/dev/null; then
     SMI_MEM_CACHE="$(nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
 fi
 
-# Arrays for unlockable GPUs (parallel): BDF, devid, profile, expected_mib, current_mib
 GPU_BDFS=()
 GPU_DEVIDS=()
 GPU_PROFILES=()
@@ -210,7 +209,6 @@ case "${CARD_PROFILE}" in
         ;;
 esac
 
-# Build inventory lines for build.sh (BDF devid profile expected_mib)
 GPU_INVENTORY_LINES=()
 for i in "${!GPU_BDFS[@]}"; do
     GPU_INVENTORY_LINES+=("${GPU_BDFS[$i]} ${GPU_DEVIDS[$i]} ${GPU_PROFILES[$i]} ${GPU_EXPECTED[$i]}")
@@ -276,9 +274,6 @@ options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"
 EOF
 ok "Wrote /etc/modprobe.d/cmp-pcie-gen2.conf"
 
-# Gen2 negotiation now occurs inside the NVIDIA driver's controlled device
-# initialization window. Remove old user-space retrain helpers: they race with
-# BAR0 access after the driver is live and can make a GPU disappear.
 for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
     systemctl disable --now "${legacy_unit}" 2>/dev/null || true
     systemctl reset-failed "${legacy_unit}" 2>/dev/null || true

@@ -54,7 +54,7 @@ else
     ok "Using cached tarball ${TARBALL}"
 fi
 
-info "Extracting clean stock sources..."
+info "Extracting sources..."
 rm -rf "${SRC_DIR}"
 tar -xzf "${TARBALL}" -C "${BUILD_ROOT}"
 if [[ ! -d "${SRC_DIR}" ]]; then
@@ -117,8 +117,6 @@ else
 import pathlib, re, sys
 path, cfg1, lmr, fb, label = sys.argv[1:6]
 text = pathlib.Path(path).read_text()
-
-# Dual-device path: both geometries are already baked into the patch.
 if (
     "SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID" in text
     and "SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID" in text
@@ -161,8 +159,6 @@ mkdir -p "${INSTALL_MOD_DIR}"
 printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
 printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
 printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
-
-# Optional per-GPU inventory from install.sh (one line: BDF devid profile expected_mib)
 if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
     printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
     ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
@@ -178,7 +174,6 @@ make clean 2>/dev/null || true
 JOBS="$(nproc)"
 make -j"${JOBS}" modules SYSSRC="${KSRC}"
 ok "Modules built"
-
 info "Installing modules to ${INSTALL_MOD_DIR}..."
 mkdir -p "${INSTALL_MOD_DIR}"
 
@@ -196,22 +191,21 @@ done
 
 depmod -a "${KVER}"
 ok "depmod complete"
-
 rebuild_initramfs() {
     if command -v update-initramfs &>/dev/null; then
-        info "Rebuilding initramfs (update-initramfs) so patched modules load at boot..."
+        info "Rebuilding initramfs (update-initramfs)..."
         update-initramfs -u -k "${KVER}"
         ok "initramfs rebuilt"
         return 0
     fi
     if command -v dracut &>/dev/null; then
-        info "Rebuilding initramfs (dracut) so patched modules load at boot..."
+        info "Rebuilding initramfs (dracut)..."
         dracut --force --kver "${KVER}"
         ok "initramfs rebuilt"
         return 0
     fi
     if command -v mkinitcpio &>/dev/null; then
-        info "Rebuilding initramfs (mkinitcpio) so patched modules load at boot..."
+        info "Rebuilding initramfs (mkinitcpio)..."
         mkinitcpio -P
         ok "initramfs rebuilt"
         return 0
@@ -221,19 +215,16 @@ rebuild_initramfs() {
 }
 
 rebuild_initramfs || true
-
 resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
 if [[ -n "${resolved}" ]]; then
     info "modprobe will load: ${resolved}"
     if [[ "${resolved}" != *"/updates/cmpunlocker/"* ]]; then
-        warn "Resolved nvidia.ko is not under updates/cmpunlocker/ — stock may still win"
+        warn "Resolved nvidia.ko is not under updates/cmpunlocker/"
     fi
 fi
-
-info "Attempting to unload existing NVIDIA modules..."
+info "Attempting to unload NVIDIA modules..."
 systemctl stop nvidia-persistenced 2>/dev/null || true
 systemctl stop nvidia-fabricmanager 2>/dev/null || true
-
 reload_ok=0
 if lsmod | grep -q '^nvidia'; then
     for mod in nvidia_drm nvidia_uvm nvidia_modeset nvidia; do
@@ -255,20 +246,17 @@ if ! lsmod | grep -q '^nvidia '; then
             reload_ok=0
         fi
     else
-        warn "modprobe failed after install"
+        warn "modprobe failed"
     fi
 else
-    warn "Could not unload nvidia modules (in use) — cold reboot required"
+    warn "Could not unload nvidia modules"
 fi
-
 echo ""
 if [[ "${reload_ok}" -eq 1 ]]; then
     ok "Build and install finished. Verify with: nvidia-smi"
-    info "If memory still shows stock size, do a cold shutdown (power off), then boot."
+    info "If memory shows stock size, do cold reboot."
 else
-    warn "Modules installed but the running driver is still stock (or unload failed)."
-    info "Perform a cold reboot: shutdown -h now  (then power on)"
-    info "After boot, confirm: cat /proc/driver/nvidia/version  (should NOT say dvs-builder)"
-    info "And: sudo dmesg | grep SEC2_DEBUG"
+    warn "Modules installed but running driver is still stock."
+    info "Perform cold reboot: shutdown -h now"
 fi
 echo ""

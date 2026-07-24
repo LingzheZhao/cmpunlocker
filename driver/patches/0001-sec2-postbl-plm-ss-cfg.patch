@@ -47,8 +47,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        NV_PRINTF(LEVEL_WARNING,
 +                  "WPR2 already up before GSP boot; continuing for recovery\n");
      }
- 
--    // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
+
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw));
  
 +    if (_kgspSec2PostblTimingEnabled(pGpu))
