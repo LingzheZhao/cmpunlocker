@@ -37,7 +37,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
  struct MIG_CI_UPDATE_CALLBACK_PARAMS
  {
-@@ -4805,14 +4820,22 @@
+@@ -4805,14 +4824,23 @@
      if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp) &&
          (!pGpu->getProperty(pGpu, PDB_PROP_GPU_PREINITIALIZED_WPR_REGION)))
      {
@@ -47,7 +47,8 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        NV_PRINTF(LEVEL_WARNING,
 +                  "WPR2 already up before GSP boot; continuing for recovery\n");
      }
-
+ 
+     // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw));
  
 +    if (_kgspSec2PostblTimingEnabled(pGpu))
@@ -63,7 +64,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
          NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspPrepareScrubberImageIfNeeded(pGpu, pKernelGsp));
-@@ -4821,6 +4844,122 @@
+@@ -4821,6 +4849,122 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  

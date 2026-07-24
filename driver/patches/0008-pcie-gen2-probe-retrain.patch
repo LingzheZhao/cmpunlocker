@@ -11,7 +11,7 @@
  
  #include <sound/core.h>             /* HDA struct snd_card */
  
-@@ -1360,6 +1364,96 @@
+@@ -1360,6 +1364,87 @@
  #if defined(NV_UVM_ENABLE)
      nv_uvm_resume_P2P(pUuid);
  #endif
