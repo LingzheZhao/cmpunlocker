@@ -27,7 +27,7 @@ step() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   cmpunlocker — System Removal         ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -172,9 +172,11 @@ fi
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}   ${GREEN}✓ cmpunlocker removed from system${CYAN}    ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
+
+echo "cmpunlocker has been removed from system."
 echo "Log saved to: ${LOG_FILE}"
 echo ""
 echo "If the GPU or display is not working, reboot once:"

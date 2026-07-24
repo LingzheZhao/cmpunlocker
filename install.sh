@@ -57,7 +57,6 @@ step() {
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# Normalize a bus ID to 0000:BB:DD.F (lowercase).
 normalize_bus_id() {
     local raw="$1"
     raw="$(echo "${raw}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -86,7 +85,6 @@ expected_mib_for_profile() {
     esac
 }
 
-# Look up current memory.total for a bus ID via nvidia-smi (empty if unavailable).
 smi_memory_for_bus() {
     local want="$1"
     local line bus mem
@@ -205,7 +203,7 @@ case "${CARD_PROFILE}" in
         info "Unlock geometry: 40GB per card (CFG1=0x02669000 LMR=0x0000028A)"
         ;;
     mixed)
-        info "Unlock geometry: 64GB for 20c2 / 40GB for 2082 (chosen at GSP boot per GPU)"
+        info "Unlock geometry: 64GB for 20c2 / 40GB for 2082"
         ;;
     *)
         die "Internal error: bad profile ${CARD_PROFILE}"
@@ -295,9 +293,10 @@ ok "Removed legacy PCIe retrain helpers"
 step "Step 6/6: Done"
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}   ${GREEN}✓ cmpunlocker install finished${CYAN}       ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
+echo "cmpunlocker install finished!"
 echo "Profile: ${CARD_PROFILE}  |  ${#GPU_BDFS[@]} GPU(s): ${COUNT_8GB}× 8gb, ${COUNT_10GB}× 10gb"
 echo ""
 echo "Per-GPU expectations after unlock:"

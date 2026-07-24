@@ -94,7 +94,7 @@ smi_memory_for_bus() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   cmpunlocker — multi-GPU verify       ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
