@@ -63,6 +63,16 @@ sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
 
+### IOMMU
+
+The installer also enables the IOMMU in passthrough mode, appending `intel_iommu=on iommu=pt` (Intel) or `amd_iommu=on iommu=pt` (AMD) to the kernel command line via `/etc/default/grub` or `/etc/kernel/cmdline`, then regenerating the boot config. Conflicting `iommu=` / `*_iommu=` entries are replaced, the original file is backed up to `*.cmpunlocker.bak`, and `remove.sh` restores it.
+
+This takes effect on the next reboot, and still requires VT-d / AMD-Vi to be enabled in BIOS/UEFI. To leave the kernel command line untouched:
+
+```bash
+sudo ./install.sh --no-iommu
+```
+
 Then perform a **cold reboot** (full power off, then boot) if modules did not hot-reload cleanly, or if memory still shows the stock size.
 
 ---

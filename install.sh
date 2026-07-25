@@ -9,16 +9,23 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
 
 PROFILE_OVERRIDE=""
+CONFIGURE_IOMMU=1
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
+        --no-iommu) CONFIGURE_IOMMU=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
+  --no-iommu      Do not touch the kernel command line (leave IOMMU settings alone)
+
+By default the installer appends intel_iommu=on / amd_iommu=on plus iommu=pt to
+the kernel command line so the IOMMU runs in passthrough mode. This takes effect
+on the next reboot.
 
 Without --profile, each unlockable GPU is classified by PCI device ID:
   10de:20c2 → 8gb / 64GB unlock
@@ -285,6 +292,138 @@ rm -f /etc/systemd/system/cmpretrain.service \
 systemctl daemon-reload
 ok "Removed legacy PCIe retrain helpers"
 
+step "Step 5c/6: Configuring IOMMU (passthrough)"
+IOMMU_STATUS="skipped"
+IOMMU_PARAMS=""
+
+iommu_params_for_cpu() {
+    local vendor=""
+    vendor="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+    case "${vendor}" in
+        GenuineIntel) echo "intel_iommu=on iommu=pt" ;;
+        AuthenticAMD) echo "amd_iommu=on iommu=pt" ;;
+        *) echo "" ;;
+    esac
+}
+
+cmdline_merge() {
+    local current="$1"
+    local token out=()
+    for token in ${current}; do
+        case "${token}" in
+            intel_iommu=*|amd_iommu=*|iommu=*) continue ;;
+            *) out+=("${token}") ;;
+        esac
+    done
+    for token in ${IOMMU_PARAMS}; do
+        out+=("${token}")
+    done
+    echo "${out[*]}"
+}
+
+configure_iommu_grub() {
+    local grub_file="/etc/default/grub"
+    local key="GRUB_CMDLINE_LINUX_DEFAULT"
+    local current merged
+
+    grep -q "^${key}=" "${grub_file}" || key="GRUB_CMDLINE_LINUX"
+    if grep -q "^${key}=" "${grub_file}"; then
+        current="$(sed -n "s/^${key}=\"\(.*\)\"$/\1/p" "${grub_file}" | head -1)"
+    else
+        current=""
+    fi
+    merged="$(cmdline_merge "${current}")"
+
+    if [[ "${current}" == "${merged}" ]]; then
+        ok "GRUB already has ${IOMMU_PARAMS} (${key})"
+        IOMMU_STATUS="already-set"
+        return 0
+    fi
+
+    cp -a "${grub_file}" "${grub_file}.cmpunlocker.bak"
+    if grep -q "^${key}=" "${grub_file}"; then
+        local escaped="${merged//\//\\/}"
+        sed -i "s/^${key}=.*/${key}=\"${escaped}\"/" "${grub_file}"
+    else
+        printf '%s="%s"\n' "${key}" "${merged}" >> "${grub_file}"
+    fi
+    ok "Set ${key}=\"${merged}\" (backup: ${grub_file}.cmpunlocker.bak)"
+
+    if command -v update-grub &>/dev/null; then
+        update-grub
+    elif command -v grub2-mkconfig &>/dev/null; then
+        local cfg="/boot/grub2/grub.cfg"
+        local efi_cfg
+        efi_cfg="$(ls /boot/efi/EFI/*/grub.cfg 2>/dev/null | head -1 || true)"
+        [[ -n "${efi_cfg}" ]] && cfg="${efi_cfg}"
+        grub2-mkconfig -o "${cfg}"
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+    else
+        warn "No grub config generator found — regenerate grub.cfg manually"
+        IOMMU_STATUS="needs-grub-regen"
+        return 0
+    fi
+    ok "Regenerated GRUB config"
+    IOMMU_STATUS="configured"
+}
+
+configure_iommu_kernel_cmdline() {
+    local file="/etc/kernel/cmdline"
+    local current merged
+    current="$(tr -d '\n' < "${file}")"
+    merged="$(cmdline_merge "${current}")"
+
+    if [[ "${current}" == "${merged}" ]]; then
+        ok "${file} already has ${IOMMU_PARAMS}"
+        IOMMU_STATUS="already-set"
+        return 0
+    fi
+
+    cp -a "${file}" "${file}.cmpunlocker.bak"
+    printf '%s\n' "${merged}" > "${file}"
+    ok "Set ${file} to \"${merged}\" (backup: ${file}.cmpunlocker.bak)"
+
+    if command -v kernel-install &>/dev/null && [[ -d /boot/loader/entries ]]; then
+        for kdir in /lib/modules/*/; do
+            kver="$(basename "${kdir}")"
+            [[ -f "${kdir}/vmlinuz" ]] || continue
+            kernel-install add "${kver}" "${kdir}/vmlinuz" 2>/dev/null || true
+        done
+        ok "Refreshed systemd-boot entries"
+        IOMMU_STATUS="configured"
+    else
+        warn "Update your boot entries so ${file} takes effect"
+        IOMMU_STATUS="needs-boot-refresh"
+    fi
+}
+
+if (( CONFIGURE_IOMMU == 0 )); then
+    warn "--no-iommu given; leaving kernel command line untouched"
+else
+    IOMMU_PARAMS="$(iommu_params_for_cpu)"
+    if [[ -z "${IOMMU_PARAMS}" ]]; then
+        warn "Unrecognized CPU vendor — cannot pick IOMMU kernel parameters; skipping"
+    elif [[ -f /etc/default/grub ]]; then
+        info "Target: ${IOMMU_PARAMS} (GRUB)"
+        configure_iommu_grub
+    elif [[ -f /etc/kernel/cmdline ]]; then
+        info "Target: ${IOMMU_PARAMS} (systemd-boot)"
+        configure_iommu_kernel_cmdline
+    else
+        warn "No /etc/default/grub or /etc/kernel/cmdline found"
+        warn "Add these to your kernel command line manually: ${IOMMU_PARAMS}"
+        IOMMU_STATUS="manual"
+    fi
+
+    if grep -qw iommu=pt /proc/cmdline 2>/dev/null && [[ -d /sys/class/iommu ]] && [[ -n "$(ls -A /sys/class/iommu 2>/dev/null)" ]]; then
+        ok "IOMMU is already active in passthrough mode on the running kernel"
+    elif [[ "${IOMMU_STATUS}" != "skipped" ]]; then
+        info "IOMMU passthrough takes effect after the next reboot"
+        warn "IOMMU must also be enabled in BIOS/UEFI (VT-d / AMD-Vi / SVM)"
+    fi
+fi
+
 step "Step 6/6: Done"
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
@@ -293,6 +432,11 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 echo "cmpunlocker install finished!"
 echo "Profile: ${CARD_PROFILE}  |  ${#GPU_BDFS[@]} GPU(s): ${COUNT_8GB}× 8gb, ${COUNT_10GB}× 10gb"
+if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
+    echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"
+else
+    echo "IOMMU:   not configured"
+fi
 echo ""
 echo "Per-GPU expectations after unlock:"
 printf "  %-16s %-8s %-8s %s\n" "BDF" "PCI ID" "Variant" "Expect MiB"
@@ -306,6 +450,7 @@ echo -e "  2. Verify all GPUs: ${CYAN}sudo ./verify.sh${NC}"
 echo -e "  3. Verify PCIe Gen2: ${CYAN}nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv${NC}  (expect 2,2)"
 echo -e "  4. Or check manually: ${CYAN}nvidia-smi${NC}"
 echo -e "  5. Unlock logs: ${CYAN}sudo dmesg | grep SEC2_DEBUG${NC}"
+echo -e "  6. Verify IOMMU after reboot: ${CYAN}cat /proc/cmdline${NC} and ${CYAN}ls /sys/class/iommu${NC}"
 echo ""
 echo "Log saved to: ${LOG_FILE}"
 echo ""
