@@ -28,7 +28,7 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
 
 ## Discord protocol
 
-If you have tried the above steps and are still having issues, please follow these steps to get help on our Discord server:
+If you have tried the above steps and are still having issues, please follow these steps to get help in the [Discord community](https://discord.gg/CdHSakKSFv):
 
 1. Open a ticket in the #issue-support channel.
 
