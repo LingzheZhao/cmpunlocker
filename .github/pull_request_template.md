@@ -1,3 +1,6 @@
+# Pull Request Template - This format is required for all PRs
+<!-- I WILL REJECT ANY PR THAT DOES NOT FOLLOW THIS TEMPLATE! -->
+
 ## Summary
 <!-- What does this PR do? One or two sentences. -->
 
