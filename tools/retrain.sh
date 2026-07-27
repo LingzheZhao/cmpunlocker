@@ -1,16 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 
-SYS=/sys/bus/pci/devices/0000:0a:00.0
+find_gpu_bdf() {
+  for id in 10de:20c2 10de:2082; do
+    lspci -d "$id" -D 2>/dev/null | head -1 | cut -d' ' -f1
+  done | head -1
+}
+
+GPU_BDF=""
 for i in $(seq 1 120); do
-  if [[ -e $SYS/resource0 ]] && nvidia-smi -L &>/dev/null; then
+  GPU_BDF="$(find_gpu_bdf)"
+  if [[ -n $GPU_BDF ]] && [[ -e /sys/bus/pci/devices/$GPU_BDF/resource0 ]] && nvidia-smi -L &>/dev/null; then
     break
   fi
   sleep 1
 done
-if ! nvidia-smi -L &>/dev/null; then
+if [[ -z $GPU_BDF ]] || ! nvidia-smi -L &>/dev/null; then
   exit 0
 fi
+SYS=/sys/bus/pci/devices/$GPU_BDF
 
 mem="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)"
 if [[ -z "${mem}" || "${mem}" == "[N/A]" ]]; then
@@ -27,11 +35,12 @@ if [[ "${max}" != "2" && "${max}" != "3" && "${max}" != "4" ]]; then
   exit 0
 fi
 
-python3 - <<'PY'
+UP_BDF="$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/$GPU_BDF")")")"
+GPU_BDF="$GPU_BDF" UP_BDF="$UP_BDF" python3 - <<'PY'
 import os, mmap, struct, time, subprocess
 
-GPU, UP = "0a:00.0", "09:01.0"
-PATH = "/sys/bus/pci/devices/0000:0a:00.0/resource0"
+GPU, UP = os.environ["GPU_BDF"].removeprefix("0000:"), os.environ["UP_BDF"].removeprefix("0000:")
+PATH = f"/sys/bus/pci/devices/{os.environ['GPU_BDF']}/resource0"
 
 def run(cmd):
     return subprocess.check_output(cmd, text=True).strip()
