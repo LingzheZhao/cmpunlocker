@@ -12,7 +12,7 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
 
 ## nvidia-smi shows 8192 or 10240 MiB (not 65536 or 40960)
 
-- All the PLMs must show `0xffffffff`. If not, cold reboot and try again. 
+- All the PLMs must show `0xffffffff`. Run `sudo dmesg | grep SEC2_DEBUG`to confirm.
 
 - If this still persists, refer to the Discord protocol at the end of the document.
 
