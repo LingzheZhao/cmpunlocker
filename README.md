@@ -2,25 +2,10 @@
 
 Unlock tool for the NVIDIA CMP 170HX (GA100) mining card. Restores full SM compute throughput and unlocked HBM2e memory geometry that are restricted in firmware/OTP configuration.
 
-Targets **nvidia-open driver 610.43.0x** on Linux. cmpunlocker does **not** install the full NVIDIA userspace package — it patches and installs open kernel modules only.
 
 **[Join our Discord community](https://discord.gg/CdHSakKSFv)** for support and discussions.
 
 ---
-
-## Background
-
-The CMP 170HX is a physically complete GA100 die (same silicon as the A100) with compute and memory artificially limited. This tool applies an in-driver unlock path (SEC2 Booter PLM open + host SS0/SS1/CFG1/LMR writes + FB/PMA adjustments) that runs automatically every time the patched modules boot GSP for PCI ID `0x20C2`.
-
-Card size selects the memory geometry:
-
-| Physical card | Unlock geometry | CFG1 | LMR |
-|---|---|---|---|
-| **8 GB** | **64 GB** | `0x02779000` | `0x0000020B` |
-| **10 GB** | **40 GB** | `0x02669000` | `0x0000028A` |
-
----
-
 ## Proof of Concept
 
 Below are memory and performance results after applying the unlock:
@@ -50,42 +35,20 @@ Below are memory and performance results after applying the unlock:
 
 ## Install
 
-One command. Auto-detects 8GB vs 10GB from stock `nvidia-smi` memory, then builds patched open kernel modules into `/lib/modules/$(uname -r)/updates/cmpunlocker/`.
+To install cmpunlocker, run the following command:
 
 ```bash
 sudo ./install.sh
 ```
 
-Force a profile if detection is wrong or `nvidia-smi` is unavailable:
+To force a certain memory profile, use the `--profile` option:
 
 ```bash
 sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
 
-Then perform a **cold reboot** (full power off, then boot) if modules did not hot-reload cleanly, or if memory still shows the stock size.
-
----
-
-## Verify
-
-```bash
-nvidia-smi
-# 8GB card:  expect ~65536 MiB
-# 10GB card: expect ~40960 MiB
-
-nvidia-smi --query-gpu=memory.total,clocks.max.sm --format=csv
-
-sudo dmesg | grep SEC2_DEBUG
-# Expected: PLMs opening to 0xffffffff, CFG1/LMR/SS0/SS1 writes, late PMA
-
-cat /lib/modules/$(uname -r)/updates/cmpunlocker/card_profile
-# 8gb or 10gb
-```
-
-Booter status codes such as `0x31` / `0xffff` during the early PLM Booter passes can appear and are often harmless if the final boot succeeds.
-
----
+Then perform a cold reboot (full power off, then boot).
 
 ## What Gets Unlocked
 
@@ -99,15 +62,13 @@ Booter status codes such as `0x31` / `0xffff` during the early PLM Booter passes
 
 ## Uninstall
 
-Restore stock module loading:
+To uninstall cmpunlocker, run the following command:
 
 ```bash
-sudo ./remove.sh --yes
+sudo ./uninstall.sh --yes
 ```
 
-This removes `/lib/modules/*/updates/cmpunlocker/`, runs `depmod`, and attempts to reload stock NVIDIA modules. Reboot if the GPU does not come back cleanly.
-
----
+Then perform a cold reboot (full power off, then boot).
 
 ## Support & Community
 
