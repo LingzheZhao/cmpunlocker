@@ -54,7 +54,7 @@ else
     ok "Using cached tarball ${TARBALL}"
 fi
 
-info "Extracting clean stock sources..."
+info "Extracting sources..."
 rm -rf "${SRC_DIR}"
 tar -xzf "${TARBALL}" -C "${BUILD_ROOT}"
 if [[ ! -d "${SRC_DIR}" ]]; then
@@ -79,6 +79,7 @@ PROFILE="${CMPUNLOCKER_CARD_PROFILE:-8gb}"
 GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
 [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
 
+SKIP_GEOMETRY_REWRITE=0
 case "${PROFILE}" in
     8gb|8GB)
         PROFILE="8gb"
@@ -94,19 +95,28 @@ case "${PROFILE}" in
         FB_BYTES="0x0000000A00000000"
         UNLOCK_LABEL="40GB"
         ;;
+    mixed|MIXED)
+        PROFILE="mixed"
+        CFG1="0x02779000"
+        LMR="0x0000020B"
+        FB_BYTES="0x0000001000000000"
+        UNLOCK_LABEL="mixed"
+        SKIP_GEOMETRY_REWRITE=1
+        ;;
     *)
-        die "Unknown CMPUNLOCKER_CARD_PROFILE='${PROFILE}' (use 8gb or 10gb)"
+        die "Unknown CMPUNLOCKER_CARD_PROFILE='${PROFILE}' (use 8gb, 10gb, or mixed)"
         ;;
 esac
 
 info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry)..."
 
-python3 - "${GSP_C}" "${CFG1}" "${LMR}" "${FB_BYTES}" "${UNLOCK_LABEL}" <<'PY'
+if [[ "${SKIP_GEOMETRY_REWRITE}" -eq 1 ]]; then
+    info "mixed profile: runtime device-id geometry (no build-time CFG1/LMR rewrite)"
+else
+    python3 - "${GSP_C}" "${CFG1}" "${LMR}" "${FB_BYTES}" "${UNLOCK_LABEL}" <<'PY'
 import pathlib, re, sys
 path, cfg1, lmr, fb, label = sys.argv[1:6]
 text = pathlib.Path(path).read_text()
-
-# Dual-device path: both geometries are already baked into the patch.
 if (
     "SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID" in text
     and "SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID" in text
@@ -143,11 +153,18 @@ if n1 != 1 or n2 != 1 or n3 != 1:
 pathlib.Path(path).write_text(text2)
 print(f"cfg1={cfg1} lmr={lmr} fb={fb} ({label})")
 PY
-ok "Memory profile ${PROFILE}: CFG1=${CFG1} LMR=${LMR} fb=${FB_BYTES} (${UNLOCK_LABEL})"
+fi
+ok "Memory profile ${PROFILE}: unlock_geometry=${UNLOCK_LABEL}"
 mkdir -p "${INSTALL_MOD_DIR}"
 printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
 printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
 printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
+if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
+    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
+    ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
+else
+    : > "${INSTALL_MOD_DIR}/gpu_inventory"
+fi
 
 info "Building modules for kernel ${KVER}..."
 cd "${SRC_DIR}"
@@ -157,7 +174,6 @@ make clean 2>/dev/null || true
 JOBS="$(nproc)"
 make -j"${JOBS}" modules SYSSRC="${KSRC}"
 ok "Modules built"
-
 info "Installing modules to ${INSTALL_MOD_DIR}..."
 mkdir -p "${INSTALL_MOD_DIR}"
 
@@ -175,22 +191,21 @@ done
 
 depmod -a "${KVER}"
 ok "depmod complete"
-
 rebuild_initramfs() {
     if command -v update-initramfs &>/dev/null; then
-        info "Rebuilding initramfs (update-initramfs) so patched modules load at boot..."
+        info "Rebuilding initramfs (update-initramfs)..."
         update-initramfs -u -k "${KVER}"
         ok "initramfs rebuilt"
         return 0
     fi
     if command -v dracut &>/dev/null; then
-        info "Rebuilding initramfs (dracut) so patched modules load at boot..."
+        info "Rebuilding initramfs (dracut)..."
         dracut --force --kver "${KVER}"
         ok "initramfs rebuilt"
         return 0
     fi
     if command -v mkinitcpio &>/dev/null; then
-        info "Rebuilding initramfs (mkinitcpio) so patched modules load at boot..."
+        info "Rebuilding initramfs (mkinitcpio)..."
         mkinitcpio -P
         ok "initramfs rebuilt"
         return 0
@@ -200,19 +215,16 @@ rebuild_initramfs() {
 }
 
 rebuild_initramfs || true
-
 resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
 if [[ -n "${resolved}" ]]; then
     info "modprobe will load: ${resolved}"
     if [[ "${resolved}" != *"/updates/cmpunlocker/"* ]]; then
-        warn "Resolved nvidia.ko is not under updates/cmpunlocker/ — stock may still win"
+        warn "Resolved nvidia.ko is not under updates/cmpunlocker/"
     fi
 fi
-
-info "Attempting to unload existing NVIDIA modules..."
+info "Attempting to unload NVIDIA modules..."
 systemctl stop nvidia-persistenced 2>/dev/null || true
 systemctl stop nvidia-fabricmanager 2>/dev/null || true
-
 reload_ok=0
 if lsmod | grep -q '^nvidia'; then
     for mod in nvidia_drm nvidia_uvm nvidia_modeset nvidia; do
@@ -234,20 +246,17 @@ if ! lsmod | grep -q '^nvidia '; then
             reload_ok=0
         fi
     else
-        warn "modprobe failed after install"
+        warn "modprobe failed"
     fi
 else
-    warn "Could not unload nvidia modules (in use) — cold reboot required"
+    warn "Could not unload nvidia modules"
 fi
-
 echo ""
 if [[ "${reload_ok}" -eq 1 ]]; then
     ok "Build and install finished. Verify with: nvidia-smi"
-    info "If memory still shows stock size, do a cold shutdown (power off), then boot."
+    info "If memory shows stock size, do cold reboot."
 else
-    warn "Modules installed but the running driver is still stock (or unload failed)."
-    info "Perform a cold reboot: shutdown -h now  (then power on)"
-    info "After boot, confirm: cat /proc/driver/nvidia/version  (should NOT say dvs-builder)"
-    info "And: sudo dmesg | grep SEC2_DEBUG"
+    warn "Modules installed but running driver is still stock."
+    info "Perform cold reboot: shutdown -h now"
 fi
 echo ""

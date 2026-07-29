@@ -27,16 +27,18 @@ step() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   cmpunlocker — System Removal         ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
 if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     warn "This removes cmpunlocker patched kernel modules:"
-    echo "  - Stops leftover cmpunlocker systemd service (if present)"
+    echo "  - Stops cmpunlocker systemd service"
     echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Reloads stock NVIDIA modules (brief display interruption)"
+    echo "  - Removes cmpretrain service / modprobe Gen2 helpers"
+    echo "  - Restores the pre-install kernel command line (reverts IOMMU changes)"
     echo ""
     echo "Run: sudo ./remove.sh --yes"
     exit 1
@@ -71,6 +73,40 @@ if [[ -f "${SERVICE_FILE}" ]]; then
     ok "Removed ${SERVICE_FILE}"
 fi
 pkill -f "${INSTALL_DIR}/daemon/watchdog.py" 2>/dev/null || true
+
+for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
+    systemctl disable --now "${legacy_unit}" 2>/dev/null || true
+    systemctl reset-failed "${legacy_unit}" 2>/dev/null || true
+done
+rm -f /etc/systemd/system/cmpretrain.service /usr/local/sbin/retrain.sh
+rm -f /etc/systemd/system/cmp-gen2-retrain.service /usr/local/sbin/cmp-gen2-retrain.sh
+rm -f /etc/modprobe.d/cmp-pcie-gen2.conf
+systemctl disable --now gen2.service 2>/dev/null || true
+systemctl reset-failed gen2.service 2>/dev/null || true
+rm -f /etc/systemd/system/gen2.service /usr/local/sbin/gen2-hammer
+systemctl daemon-reload 2>/dev/null || true
+ok "Removed PCIe Gen2 helpers"
+
+iommu_restored=0
+for cfg in /etc/default/grub /etc/kernel/cmdline; do
+    if [[ -f "${cfg}.cmpunlocker.bak" ]]; then
+        mv -f "${cfg}.cmpunlocker.bak" "${cfg}"
+        ok "Restored ${cfg} from pre-install backup"
+        iommu_restored=1
+    fi
+done
+if (( iommu_restored )); then
+    if command -v update-grub &>/dev/null; then
+        update-grub 2>/dev/null || true
+    elif command -v grub2-mkconfig &>/dev/null; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
+    fi
+    ok "Reverted IOMMU kernel parameters (effective after reboot)"
+else
+    warn "No IOMMU config backup found — kernel command line left as-is"
+fi
 
 step "Step 3/5: Removing patched modules and legacy files"
 mod_removed=0
@@ -161,9 +197,11 @@ fi
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}   ${GREEN}✓ cmpunlocker removed from system${CYAN}    ║${NC}"
+echo -e "${CYAN}║               cmpunlocker              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
+
+echo "cmpunlocker has been removed from system."
 echo "Log saved to: ${LOG_FILE}"
 echo ""
 echo "If the GPU or display is not working, reboot once:"
