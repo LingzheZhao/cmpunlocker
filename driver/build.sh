@@ -66,8 +66,6 @@ ok "Sources ready: ${SRC_DIR}"
 
 info "Applying unlock patches..."
 cd "${SRC_DIR}"
-# Order matters: each patch's hunks are line-numbered against the tree left by
-# the ones before it, so this list is the required apply order, not just a manifest.
 PATCH_ORDER=(
     sec2-postbl-plm-ss-cfg.patch
     booter-verify.patch
