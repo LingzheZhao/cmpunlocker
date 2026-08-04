@@ -66,11 +66,23 @@ ok "Sources ready: ${SRC_DIR}"
 
 info "Applying unlock patches..."
 cd "${SRC_DIR}"
-shopt -s nullglob
-patches=("${PATCH_DIR}"/*.patch)
-[[ ${#patches[@]} -gt 0 ]] || die "No patches found in ${PATCH_DIR}"
-for p in "${patches[@]}"; do
-    info "  $(basename "${p}")"
+# Order matters: each patch's hunks are line-numbered against the tree left by
+# the ones before it, so this list is the required apply order, not just a manifest.
+PATCH_ORDER=(
+    sec2-postbl-plm-ss-cfg.patch
+    booter-verify.patch
+    late-pma.patch
+    bar0-pramin-clamp.patch
+    ce-scrub-workarounds.patch
+    persistent-sw-state.patch
+    pcie-gen2.patch
+    pcie-gen2-probe-retrain.patch
+    name-string.patch
+)
+for name in "${PATCH_ORDER[@]}"; do
+    p="${PATCH_DIR}/${name}"
+    [[ -f "${p}" ]] || die "Missing patch: ${p}"
+    info "  ${name}"
     patch -p1 < "${p}"
 done
 ok "All patches applied"

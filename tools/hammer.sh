@@ -2,7 +2,7 @@
 # Early-boot PCIe Gen2 retrain loop for CMP 170HX (10de:20c2 / 10de:2082).
 #
 # The Gen2 capability the driver's probe-time patch exposes
-# (driver/patches/0008-pcie-gen2-probe-retrain.patch) is only open for a
+# (driver/patches/pcie-gen2-probe-retrain.patch) is only open for a
 # short window during GSP bootstrap. If the driver's own one-shot retrain
 # misses that window, this script keeps requesting Gen2 from the GPU's
 # upstream bridge every ~50ms until it lands or the attempt budget runs out.
