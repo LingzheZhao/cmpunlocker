@@ -14,7 +14,7 @@ die()  { err "$*"; exit 1; }
 banner() {
     echo ""
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║               cmpunlocker               ║${NC}"
+    echo -e "${CYAN}║               cmpunlocker              ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo ""
 }
