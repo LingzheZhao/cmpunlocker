@@ -186,7 +186,8 @@ if [[ -r /proc/driver/nvidia/version ]]; then
     detected="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version | head -1 || true)"
 fi
 if [[ -z "${detected}" ]] && command -v nvidia-smi &>/dev/null; then
-    detected="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+    smi_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+    [[ "${smi_version}" =~ ^[0-9]+(\.[0-9]+)+$ ]] && detected="${smi_version}"
 fi
 if [[ -z "${detected}" ]]; then
     for cand in "${SUPPORTED_VERSIONS[@]}"; do
