@@ -15,7 +15,7 @@ if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     echo "  - Stops cmpunlocker systemd service"
     echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
-    echo "  - Reloads stock NVIDIA modules (brief display interruption)"
+    echo "  - Leaves running NVIDIA modules untouched until a required cold power-off"
     echo "  - Removes cmpretrain service / modprobe Gen2 helpers"
     echo "  - Restores the pre-install kernel command line (reverts IOMMU changes)"
     echo ""
@@ -37,8 +37,27 @@ LOG_FILE="${LOG_DIR}/remove_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 step "Stopping cmpunlocker service and PCIe/IOMMU helpers"
-if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-    systemctl stop "${SERVICE_NAME}" || true
+service_was_active=0
+service_state_rc=0
+systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null || service_state_rc=$?
+case "${service_state_rc}" in
+    0)
+        service_was_active=1
+        systemctl stop "${SERVICE_NAME}" || die "Could not stop ${SERVICE_NAME} service"
+        ;;
+    3|4)
+        ;;
+    *)
+        die "Could not determine whether ${SERVICE_NAME} service is active"
+        ;;
+esac
+service_state_rc=0
+systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null || service_state_rc=$?
+if (( service_state_rc == 0 )); then
+    die "${SERVICE_NAME} service is still active after the stop request"
+elif (( service_state_rc != 3 && service_state_rc != 4 )); then
+    die "Could not verify that ${SERVICE_NAME} service stopped"
+elif (( service_was_active == 1 )); then
     ok "Service stopped"
 else
     warn "Service not running"
@@ -53,7 +72,18 @@ if [[ -f "${SERVICE_FILE}" ]]; then
     systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
     ok "Removed ${SERVICE_FILE}"
 fi
-pkill -f "${INSTALL_DIR}/daemon/watchdog.py" 2>/dev/null || true
+watchdog_stop_rc=0
+pkill -f -- "${INSTALL_DIR}/daemon/watchdog.py" 2>/dev/null || watchdog_stop_rc=$?
+(( watchdog_stop_rc == 0 || watchdog_stop_rc == 1 )) || \
+    die "Could not stop the legacy cmpunlocker watchdog"
+watchdog_check_rc=0
+pgrep -f -- "${INSTALL_DIR}/daemon/watchdog.py" >/dev/null 2>&1 || watchdog_check_rc=$?
+if (( watchdog_check_rc == 0 )); then
+    die "Legacy cmpunlocker watchdog is still running"
+elif (( watchdog_check_rc != 1 )); then
+    die "Could not verify that the legacy cmpunlocker watchdog stopped"
+fi
+ok "Legacy watchdog is not running"
 
 info "Removing PCIe Gen2 helpers"
 for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
@@ -80,11 +110,15 @@ for cfg in /etc/default/grub /etc/kernel/cmdline; do
 done
 if (( iommu_restored )); then
     if command -v update-grub &>/dev/null; then
-        update-grub 2>/dev/null || true
+        update-grub || die "update-grub failed after restoring the kernel command line"
     elif command -v grub2-mkconfig &>/dev/null; then
-        grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+        grub2-mkconfig -o /boot/grub2/grub.cfg || \
+            die "grub2-mkconfig failed after restoring the kernel command line"
     elif command -v grub-mkconfig &>/dev/null; then
-        grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
+        grub-mkconfig -o /boot/grub/grub.cfg || \
+            die "grub-mkconfig failed after restoring the kernel command line"
+    else
+        die "Kernel command line restored, but no supported bootloader regeneration tool was found; regenerate the bootloader configuration manually before rebooting"
     fi
     ok "Reverted IOMMU kernel parameters (effective after reboot)"
 else
@@ -99,7 +133,8 @@ for mod_dir in /lib/modules/*/updates/cmpunlocker; do
     if [[ -d "${mod_dir}" ]]; then
         kernel="$(basename "$(dirname "$(dirname "${mod_dir}")")")"
         rm -rf "${mod_dir}"
-        depmod -a "${kernel}" 2>/dev/null || true
+        depmod -a "${kernel}" || \
+            die "depmod failed for kernel ${kernel} after patched modules were removed"
         ok "Removed patched modules for kernel ${kernel}"
         mod_removed=$((mod_removed + 1))
         kernels_touched+=("${kernel}")
@@ -109,17 +144,52 @@ done
 
 if [[ ${#kernels_touched[@]} -gt 0 ]]; then
     info "Rebuilding initramfs so stock modules are packed again..."
-    for kernel in "${kernels_touched[@]}"; do
-        if command -v update-initramfs &>/dev/null; then
-            update-initramfs -u -k "${kernel}" 2>/dev/null || true
-        elif command -v dracut &>/dev/null; then
-            dracut --force --kver "${kernel}" 2>/dev/null || true
-        fi
-    done
-    if command -v mkinitcpio &>/dev/null && ! command -v update-initramfs &>/dev/null && ! command -v dracut &>/dev/null; then
-        mkinitcpio -P 2>/dev/null || true
+    initramfs_manual_recovery="Patched modules are already removed for kernel(s): ${kernels_touched[*]}. Manually rebuild each affected initramfs before rebooting."
+    if command -v update-initramfs &>/dev/null; then
+        for kernel in "${kernels_touched[@]}"; do
+            update-initramfs -u -k "${kernel}" || \
+                die "update-initramfs failed for ${kernel}. ${initramfs_manual_recovery}"
+        done
+    elif command -v dracut &>/dev/null; then
+        for kernel in "${kernels_touched[@]}"; do
+            dracut --force --kver "${kernel}" || \
+                die "dracut failed for ${kernel}. ${initramfs_manual_recovery}"
+        done
+    elif command -v mkinitcpio &>/dev/null; then
+        mkinitcpio -P || die "mkinitcpio failed. ${initramfs_manual_recovery}"
+    else
+        die "No supported initramfs rebuild tool was found. ${initramfs_manual_recovery}"
     fi
-    ok "initramfs rebuild attempted"
+    ok "Rebuilt initramfs with the stock module selection"
+
+    for kernel in "${kernels_touched[@]}"; do
+        modprobe_plan="$(modprobe --set-version "${kernel}" -n -v nvidia 2>&1)" || {
+            printf '%s\n' "${modprobe_plan}" >&2
+            die "Could not resolve the stock nvidia module for kernel ${kernel}"
+        }
+        printf '%s\n' "${modprobe_plan}"
+        [[ "${modprobe_plan}" != *"/updates/cmpunlocker/"* ]] || \
+            die "Kernel ${kernel} still resolves nvidia through cmpunlocker"
+
+        stock_module_path=""
+        while read -r modprobe_action modprobe_path _; do
+            if [[ "${modprobe_action##*/}" == "insmod" && \
+                  ( "${modprobe_path}" == "/lib/modules/${kernel}/"* || \
+                    "${modprobe_path}" == "/usr/lib/modules/${kernel}/"* ) && \
+                  "${modprobe_path}" =~ /nvidia\.ko(\.(gz|xz|zst))?$ ]]; then
+                stock_module_path="${modprobe_path}"
+                break
+            fi
+        done <<< "${modprobe_plan}"
+        [[ -n "${stock_module_path}" ]] || \
+            die "Kernel ${kernel} did not resolve nvidia to a stock module"
+        stock_module_path="$(readlink -f -- "${stock_module_path}")" || \
+            die "Could not canonicalize the stock nvidia module for kernel ${kernel}"
+        [[ -f "${stock_module_path}" && \
+           "${stock_module_path}" != *"/updates/cmpunlocker/"* ]] || \
+            die "Kernel ${kernel} did not resolve nvidia to an existing non-cmpunlocker module"
+        ok "Kernel ${kernel} resolves nvidia to ${stock_module_path}"
+    done
 fi
 
 for gsp in /lib/firmware/nvidia/*/gsp_tu10x.bin; do
@@ -138,44 +208,11 @@ else
     warn "${INSTALL_DIR} not found (ok for module-only installs)"
 fi
 
-step "Reloading stock NVIDIA driver"
+step "Preserving the running driver until power-off"
 if lsmod | grep -q '^nvidia'; then
-    warn "Unloading NVIDIA modules (display may flicker)"
-    for svc in gdm3 sddm lightdm display-manager; do
-        systemctl stop "${svc}" 2>/dev/null || true
-    done
-    systemctl stop nvidia-persistenced 2>/dev/null || true
-    killall -9 Xorg Xwayland nvidia-persistenced 2>/dev/null || true
-    sleep 1
-
-    for mod in nvidia_drm nvidia_uvm nvidia_modeset nvidia; do
-        modprobe -r "${mod}" 2>/dev/null || true
-    done
-    sleep 1
-
-    if lsmod | grep -q '^nvidia'; then
-        for mod in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
-            rmmod -f "${mod}" 2>/dev/null || true
-        done
-    fi
-
-    if modprobe nvidia 2>/dev/null; then
-        modprobe nvidia-modeset 2>/dev/null || true
-        modprobe nvidia-uvm 2>/dev/null || true
-        modprobe nvidia-drm 2>/dev/null || true
-        ok "Stock NVIDIA driver reloaded"
-    else
-        warn "Could not reload NVIDIA driver — reboot to finish cleanup"
-    fi
-
-    for svc in gdm3 sddm lightdm display-manager; do
-        if systemctl is-enabled --quiet "${svc}" 2>/dev/null; then
-            systemctl start "${svc}" 2>/dev/null || true
-            break
-        fi
-    done
+    warn "NVIDIA modules remain loaded; hot replacement is unsafe after changing FB/WPR geometry"
 else
-    warn "NVIDIA modules not loaded — skipping driver reload"
+    info "No running NVIDIA modules need to be preserved"
 fi
 
 step "Done"
@@ -183,6 +220,7 @@ banner
 echo "cmpunlocker has been removed from system."
 echo "Log saved to: ${LOG_FILE}"
 echo ""
-echo "If the GPU or display is not working, reboot once:"
-echo -e "  ${CYAN}sudo reboot${NC}"
+echo "A complete power-off/power-on transition is required before stock modules may load:"
+echo -e "  ${CYAN}sudo shutdown -h now${NC}"
+echo "After shutdown, remove standby power long enough for the GPU to lose state, then power on."
 echo ""
