@@ -1,6 +1,5 @@
-diff -Naur a/src/nvidia/generated/g_kernel_gsp_nvoc.h b/src/nvidia/generated/g_kernel_gsp_nvoc.h
---- a/src/nvidia/generated/g_kernel_gsp_nvoc.h	2026-07-18 11:26:26.833302560 -0700
-+++ b/src/nvidia/generated/g_kernel_gsp_nvoc.h	2026-07-18 11:26:26.834341525 -0700
+--- a/src/nvidia/generated/g_kernel_gsp_nvoc.h
++++ b/src/nvidia/generated/g_kernel_gsp_nvoc.h
 @@ -544,6 +544,8 @@
      RM_RISCV_UCODE_DESC *pGspRmBootUcodeDesc;
      MEMORY_DESCRIPTOR *pGspUCodeRadix3Descriptor;
@@ -10,10 +9,9 @@ diff -Naur a/src/nvidia/generated/g_kernel_gsp_nvoc.h b/src/nvidia/generated/g_k
      GspSystemInfo *pSystemInfo;
      NvU32 regTableSize;
      PACKED_REGISTRY_TABLE *pRegTable;
-diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
---- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c	2026-07-18 11:26:26.827164897 -0700
-+++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c	2026-07-18 11:26:26.828254361 -0700
-@@ -102,6 +102,23 @@
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -102,6 +102,287 @@
  
  #include "crashcat/crashcat_report.h"
  
@@ -22,6 +20,12 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +#define SEC2_POSTBL_TIMING_SIGNATURE_SIZE          0x0000f800ULL
 +#define SEC2_POSTBL_TIMING_FILL_DWORD              0x000004a7U
 +#define SEC2_POSTBL_TIMING_DMEM_PATH               "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
++#define SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT     0x00010000ULL
++#define SEC2_POSTBL_TIMING_STOCK_8GB_FB_BYTES      0x0000000200000000ULL
++#define SEC2_POSTBL_TIMING_STOCK_10GB_FB_BYTES     0x0000000280000000ULL
++/* Product-capacity gate; protected-memory safety is checked independently. */
++#define SEC2_POSTBL_TIMING_MAX_NATIVE_NONPUBLIC_BYTES 0x0000000080000000ULL
++#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT       "cmpunlocker-safety-v3"
 +
 +NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
 +                                           NvU32 writeAddr, NvU32 writeValue);
@@ -34,20 +38,268 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +    return (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID ||
 +            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID);
 +}
++
++/*
++ * Pure, read-only validation of the GSP-provided region table.  Keep GPU
++ * object access and diagnostics in the wrapper below so this logic can be
++ * exercised independently with boundary-value vectors.
++ */
++static NV_STATUS
++_kgspSec2PostblTimingValidateFbRegionTable
++(
++    const NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *pParams,
++    NvU64 fbLength,
++    NvU64 metaFbSize,
++    NvU64 protectedStart,
++    NvU64 minPublicBytes,
++    NvU64 *pPublicBytes,
++    NvU64 *pReservedRegionBytes
++)
++{
++    NvU32 i;
++    NvU64 expectedBase = 0;
++    NvU64 totalBytes = 0;
++    NvU64 publicBytes = 0;
++    NvU64 reservedRegionBytes = 0;
++
++    if (pParams == NULL || pPublicBytes == NULL ||
++        pReservedRegionBytes == NULL ||
++        fbLength == 0 || fbLength != metaFbSize ||
++        minPublicBytes > metaFbSize ||
++        (metaFbSize & (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (protectedStart & (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        protectedStart == 0 || protectedStart >= metaFbSize ||
++        pParams->numFBRegions == 0 ||
++        pParams->numFBRegions >
++            NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_MAX_ENTRIES)
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    for (i = 0; i < pParams->numFBRegions; i++)
++    {
++        const NV2080_CTRL_CMD_FB_GET_FB_REGION_FB_REGION_INFO *pRegion =
++            &pParams->fbRegion[i];
++        NvU64 nextBase;
++        NvU64 regionBytes;
++
++        if (pRegion->base != expectedBase || pRegion->limit < pRegion->base ||
++            pRegion->limit == NV_U64_MAX)
++        {
++            return NV_ERR_INVALID_STATE;
++        }
++
++        nextBase = pRegion->limit + 1;
++        if ((pRegion->base &
++                (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++            (nextBase & (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++            nextBase > metaFbSize)
++        {
++            return NV_ERR_INVALID_STATE;
++        }
++
++        regionBytes = nextBase - pRegion->base;
++        if (totalBytes > NV_U64_MAX - regionBytes)
++            return NV_ERR_INVALID_STATE;
++        totalBytes += regionBytes;
++
++        if (pRegion->reserved != 0)
++        {
++            /* FWCLIENT maps any nonzero reservation as a full reserved region. */
++            if (pRegion->reserved != regionBytes ||
++                reservedRegionBytes > NV_U64_MAX - regionBytes)
++            {
++                return NV_ERR_INVALID_STATE;
++            }
++            reservedRegionBytes += regionBytes;
++        }
++        else
++        {
++            if (pRegion->bProtected ||
++                pRegion->regionTag != NV2080_FB_REGION_TAG_NONE ||
++                pRegion->limit >= protectedStart ||
++                publicBytes > NV_U64_MAX - regionBytes)
++            {
++                return NV_ERR_INVALID_STATE;
++            }
++            publicBytes += regionBytes;
++        }
++
++        expectedBase = nextBase;
++    }
++
++    if (expectedBase != metaFbSize || totalBytes != metaFbSize ||
++        publicBytes > totalBytes ||
++        reservedRegionBytes != totalBytes - publicBytes)
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    {
++        const NV2080_CTRL_CMD_FB_GET_FB_REGION_FB_REGION_INFO *pTopRegion =
++            &pParams->fbRegion[pParams->numFBRegions - 1];
++        NvU64 protectedBytes = metaFbSize - protectedStart;
++
++        if (pTopRegion->base != protectedStart ||
++            pTopRegion->limit != metaFbSize - 1 ||
++            pTopRegion->reserved != protectedBytes ||
++            pTopRegion->bProtected ||
++            pTopRegion->regionTag != NV2080_FB_REGION_TAG_GSP_CARVEOUT)
++        {
++            return NV_ERR_INVALID_STATE;
++        }
++    }
++
++    if (publicBytes < minPublicBytes)
++        return NV_ERR_INVALID_STATE;
++
++    *pPublicBytes = publicBytes;
++    *pReservedRegionBytes = reservedRegionBytes;
++    return NV_OK;
++}
++
++/*
++ * Validate the native GSP FB map before MemoryManager copies it and creates
++ * the heap/PMA objects.  This function is deliberately read-only: publishing
++ * a larger fb_length or repairing a malformed region table here would make
++ * CPU-RM trust geometry which GSP-RM did not actually materialize.
++ */
++static NV_STATUS
++_kgspSec2PostblTimingValidateFbLayout(OBJGPU *pGpu, KernelGsp *pKernelGsp)
++{
++    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU64 expectedFbSize =
++        (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
++            ? 0x0000001000000000ULL
++            : 0x0000000A00000000ULL;
++    NvU64 stockFbSize =
++        (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
++            ? SEC2_POSTBL_TIMING_STOCK_8GB_FB_BYTES
++            : SEC2_POSTBL_TIMING_STOCK_10GB_FB_BYTES;
++    const GspStaticConfigInfo *pGSCI = &pKernelGsp->gspStaticInfo;
++    const NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *pParams =
++        &pGSCI->fbRegionInfoParams;
++    GspFwWprMeta *pWprMeta = pKernelGsp->pWprMeta;
++    NvU32 numRegions = pParams->numFBRegions;
++    NvU64 publicBytes = 0;
++    NvU64 reservedRegionBytes = 0;
++    NvU64 metaMagic = 0;
++    NvU64 metaRevision = 0;
++    NvU64 metaFbSize = 0;
++    NvU64 protectedStart = 0;
++    const char *pReason = NULL;
++
++    if (devId != SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID &&
++        devId != SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID)
++    {
++        pReason = "unsupported PCI device";
++        goto fail;
++    }
++
++    if (pWprMeta == NULL || pKernelGsp->pWprMetaDescriptor == NULL ||
++        memdescGetSize(pKernelGsp->pWprMetaDescriptor) < sizeof(*pWprMeta))
++    {
++        pReason = "WPR metadata unavailable or truncated";
++        goto fail;
++    }
++
++    metaMagic = pWprMeta->magic;
++    metaRevision = pWprMeta->revision;
++    metaFbSize = pWprMeta->fbSize;
++    protectedStart = pWprMeta->gspFwRsvdStart;
++
++    if (metaMagic != GSP_FW_WPR_META_MAGIC ||
++        metaRevision != GSP_FW_WPR_META_REVISION)
++    {
++        pReason = "WPR metadata magic/revision mismatch";
++        goto fail;
++    }
++
++    if (metaFbSize != expectedFbSize || pGSCI->fb_length != expectedFbSize)
++    {
++        pReason = "native FB size does not match PCI geometry";
++        goto fail;
++    }
++
++    if ((metaFbSize & (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (protectedStart & (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        protectedStart <= stockFbSize ||
++        protectedStart >= metaFbSize)
++    {
++        pReason = "invalid or unaligned protected boundary";
++        goto fail;
++    }
++
++    if ((pWprMeta->gspFwWprStart &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (pWprMeta->nonWprHeapOffset &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (pWprMeta->nonWprHeapSize &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (pWprMeta->gspFwWprEnd &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (pWprMeta->gspFwHeapOffset &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        (pWprMeta->gspFwHeapSize &
++            (SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT - 1)) != 0 ||
++        pWprMeta->nonWprHeapSize == 0 ||
++        protectedStart != pWprMeta->nonWprHeapOffset ||
++        pWprMeta->nonWprHeapOffset >
++            NV_U64_MAX - pWprMeta->nonWprHeapSize ||
++        pWprMeta->nonWprHeapOffset + pWprMeta->nonWprHeapSize !=
++            pWprMeta->gspFwWprStart ||
++        pWprMeta->gspFwWprStart >= pWprMeta->gspFwWprEnd ||
++        pWprMeta->gspFwWprEnd > metaFbSize ||
++        pWprMeta->gspFwHeapSize == 0 ||
++        pWprMeta->gspFwHeapOffset < pWprMeta->gspFwWprStart ||
++        pWprMeta->gspFwHeapOffset >= pWprMeta->gspFwWprEnd ||
++        pWprMeta->gspFwHeapSize >
++            pWprMeta->gspFwWprEnd - pWprMeta->gspFwHeapOffset)
++    {
++        pReason = "invalid or unaligned WPR/heap layout";
++        goto fail;
++    }
++
++    if (expectedFbSize <= SEC2_POSTBL_TIMING_MAX_NATIVE_NONPUBLIC_BYTES ||
++        _kgspSec2PostblTimingValidateFbRegionTable(
++            pParams,
++            pGSCI->fb_length,
++            metaFbSize,
++            protectedStart,
++            expectedFbSize - SEC2_POSTBL_TIMING_MAX_NATIVE_NONPUBLIC_BYTES,
++            &publicBytes,
++            &reservedRegionBytes) != NV_OK)
++    {
++        pReason = "native FB region table failed validation";
++        goto fail;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "SEC2_DEBUG_FB_LAYOUT: validated fbSize=0x%016llx "
++              "protectedStart=0x%016llx publicBytes=0x%016llx "
++              "capacityFloor=0x%016llx reservedRegionBytes=0x%016llx "
++              "regions=%u status=safe build=%s\n",
++              expectedFbSize, protectedStart, publicBytes,
++              expectedFbSize - SEC2_POSTBL_TIMING_MAX_NATIVE_NONPUBLIC_BYTES,
++              reservedRegionBytes,
++              numRegions, SEC2_POSTBL_TIMING_BUILD_FINGERPRINT);
++    return NV_OK;
++
++fail:
++    NV_PRINTF(LEVEL_ERROR,
++              "SEC2_DEBUG_FB_LAYOUT: rejected reason=%s devId=0x%x "
++              "fb_length=0x%016llx expected=0x%016llx "
++              "metaMagic=0x%016llx metaRevision=%llu metaFbSize=0x%016llx "
++              "protectedStart=0x%016llx regions=%u build=%s\n",
++              pReason, devId, pGSCI->fb_length, expectedFbSize,
++              metaMagic, metaRevision, metaFbSize, protectedStart,
++              numRegions, SEC2_POSTBL_TIMING_BUILD_FINGERPRINT);
++    return NV_ERR_INVALID_STATE;
++}
  
  struct MIG_CI_UPDATE_CALLBACK_PARAMS
  {
-@@ -4805,14 +4824,23 @@
-     if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp) &&
-         (!pGpu->getProperty(pGpu, PDB_PROP_GPU_PREINITIALIZED_WPR_REGION)))
-     {
--        NV_PRINTF(LEVEL_ERROR, "unexpected WPR2 already up, cannot proceed with booting GSP\n");
--        NV_PRINTF(LEVEL_ERROR, "(the GPU is likely in a bad state and may need to be reset)\n");
--        return NV_ERR_INVALID_STATE;
-+        NV_PRINTF(LEVEL_WARNING,
-+                  "WPR2 already up before GSP boot; continuing for recovery\n");
-     }
- 
+@@ -4813,6 +5094,16 @@
      // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw));
  
@@ -64,13 +316,12 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
          NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspPrepareScrubberImageIfNeeded(pGpu, pKernelGsp));
-@@ -4821,6 +4849,124 @@
+@@ -4821,6 +5112,153 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
 +    if (_kgspSec2PostblTimingEnabled(pGpu))
 +    {
-+        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
 +        NvU32 plmIdx, attempt;
 +        NV_STATUS plmStatus;
 +
@@ -120,9 +371,15 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +                    opened = NV_TRUE;
 +            }
 +            if (!opened)
++            {
++                GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++                GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
 +                NV_PRINTF(LEVEL_ERROR,
-+                          "SEC2_DEBUG: FAILED to open %s after 2 attempts\n",
-+                          plmTable[plmIdx].name);
++                          "SEC2_DEBUG: FAILED to verify required %s after 2 attempts "
++                          "(last status=0x%x); aborting GSP boot\n",
++                          plmTable[plmIdx].name, plmStatus);
++                return (plmStatus != NV_OK) ? plmStatus : NV_ERR_INVALID_STATE;
++            }
 +        }
 +
 +        GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
@@ -139,6 +396,12 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
 +            NvU32 cfg1Value;
 +            NvU32 lmrValue;
++            const NvU32 ss0Value = 0x88888888U;
++            const NvU32 ss1Value = 0x00000008U;
++            NvU32 ss0Readback;
++            NvU32 ss1Readback;
++            NvU32 cfg1Readback;
++            NvU32 lmrReadback;
 +
 +            if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
 +            {
@@ -151,10 +414,26 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +                lmrValue  = 0x0000028AU;
 +            }
 +
-+            GPU_REG_WR32(pGpu, 0x0082381cU, 0x88888888U);
-+            GPU_REG_WR32(pGpu, 0x00823820U, 0x00000008U);
++            GPU_REG_WR32(pGpu, 0x0082381cU, ss0Value);
++            GPU_REG_WR32(pGpu, 0x00823820U, ss1Value);
 +            GPU_REG_WR32(pGpu, 0x009a0204U, cfg1Value);
 +            GPU_REG_WR32(pGpu, 0x00100ce0U, lmrValue);
++
++            ss0Readback  = GPU_REG_RD32(pGpu, 0x0082381cU);
++            ss1Readback  = GPU_REG_RD32(pGpu, 0x00823820U);
++            cfg1Readback = GPU_REG_RD32(pGpu, 0x009a0204U);
++            lmrReadback  = GPU_REG_RD32(pGpu, 0x00100ce0U);
++
++            if (ss0Readback != ss0Value || ss1Readback != ss1Value ||
++                cfg1Readback != cfg1Value || lmrReadback != lmrValue)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: required SS/FB geometry write verification failed: "
++                          "SS0=0x%08x SS1=0x%08x CFG1=0x%08x LMR=0x%08x; "
++                          "aborting before GSP bootstrap/static-info update\n",
++                          ss0Readback, ss1Readback, cfg1Readback, lmrReadback);
++                return NV_ERR_INVALID_STATE;
++            }
 +
 +            NV_PRINTF(LEVEL_ERROR,
 +                      "SEC2_DEBUG: POST-WRITE SS0=0x%08x SS1=0x%08x "
@@ -177,9 +456,11 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw));
 +
 +        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG: WPR meta updated fbSize=0x%016llx wprStart=0x%016llx "
-+                  "wprEnd=0x%016llx heapOffset=0x%016llx heapSize=0x%016llx\n",
++                  "SEC2_DEBUG: WPR meta updated fbSize=0x%016llx rsvdStart=0x%016llx "
++                  "wprStart=0x%016llx wprEnd=0x%016llx heapOffset=0x%016llx "
++                  "heapSize=0x%016llx\n",
 +                  pKernelGsp->pWprMeta->fbSize,
++                  pKernelGsp->pWprMeta->gspFwRsvdStart,
 +                  pKernelGsp->pWprMeta->gspFwWprStart,
 +                  pKernelGsp->pWprMeta->gspFwWprEnd,
 +                  pKernelGsp->pWprMeta->gspFwHeapOffset,
@@ -189,61 +470,21 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      // Release the API lock if relaxed locking for parallel init is enabled
      NvBool bRelaxedLocking = _kgspShouldRelaxGspInitLocking(pGpu);
      if (bRelaxedLocking)
-@@ -5164,6 +5289,53 @@
+@@ -5164,6 +5602,13 @@
          goto done;
      }
  
++    if (_kgspSec2PostblTimingEnabled(pGpu))
 +    {
-+        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-+        if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID ||
-+            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID)
-+        {
-+            GspStaticConfigInfo *pGSCI = &pKernelGsp->gspStaticInfo;
-+            NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *pFbRegionInfoParams =
-+                &pGSCI->fbRegionInfoParams;
-+            NvU64 targetFbBytes = (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
-+                                    ? 0x0000001000000000ULL
-+                                    : 0x0000000A00000000ULL;
-+            NvU64 stockFbBytes  = 0x0000000200000000ULL;
-+            NvU32 numRegions = pFbRegionInfoParams->numFBRegions;
-+
-+            NV_PRINTF(LEVEL_ERROR,
-+                      "SEC2_DEBUG: static-info BEFORE: fb_length=0x%llx numRegions=%u\n",
-+                      pGSCI->fb_length, numRegions);
-+
-+            pGSCI->fb_length = targetFbBytes;
-+
-+            if (numRegions > 0 &&
-+                numRegions <= NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_MAX_ENTRIES)
-+            {
-+                NV2080_CTRL_CMD_FB_GET_FB_REGION_FB_REGION_INFO *pLastRegion =
-+                    &pFbRegionInfoParams->fbRegion[numRegions - 1];
-+                NvU64 highLimit = targetFbBytes - 1;
-+
-+                NV_PRINTF(LEVEL_ERROR,
-+                          "SEC2_DEBUG: last region[%u] base=0x%llx limit=0x%llx reserved=0x%llx\n",
-+                          numRegions - 1, pLastRegion->base, pLastRegion->limit, pLastRegion->reserved);
-+
-+                if (pLastRegion->limit < highLimit)
-+                {
-+                    pLastRegion->limit = highLimit;
-+                    pLastRegion->reserved = pLastRegion->limit - pLastRegion->base + 1;
-+                    pLastRegion->supportCompressed = NV_TRUE;
-+                    pLastRegion->supportISO = NV_TRUE;
-+                    pLastRegion->performance = 20;
-+                }
-+
-+                NV_PRINTF(LEVEL_ERROR,
-+                          "SEC2_DEBUG: static-info AFTER: fb_length=0x%llx last_limit=0x%llx\n",
-+                          pGSCI->fb_length, pLastRegion->limit);
-+            }
-+        }
++        status = _kgspSec2PostblTimingValidateFbLayout(pGpu, pKernelGsp);
++        if (status != NV_OK)
++            goto done;
 +    }
 +
      NV_ASSERT_OK_OR_GOTO(status, kgspInitGspTraceCrashBuffer(pGpu, pKernelGsp), done);
  
      // Set PDB properties as per data from GSP.
-@@ -5662,6 +5831,84 @@
+@@ -5662,6 +6107,84 @@
      pKernelGsp->gspRmBootUcodeSize   = 0;
  }
  
@@ -328,7 +569,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  static NV_STATUS
  _kgspCreateSignatureMemdesc
  (
-@@ -5672,6 +5919,9 @@
+@@ -5672,6 +6195,9 @@
  {
      NV_STATUS status = NV_OK;
      NvU8 *pSignatureVa = NULL;
@@ -338,7 +579,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      NvU64 flags = MEMDESC_FLAGS_NONE;
  
      if (confComputeForceUnprotAlloc(pGpu))
-@@ -5682,7 +5932,7 @@
+@@ -5682,7 +6208,7 @@
      // NOTE: align to 256 because that's the alignment needed for Booter DMA
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
          memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
@@ -347,7 +588,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
              NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
  
      memdescTagAlloc(status,
-@@ -5694,8 +5944,48 @@
+@@ -5694,8 +6220,48 @@
          (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
          fail_alloc);
  
@@ -398,7 +639,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
      pSignatureVa = NULL;
-@@ -5709,6 +5999,69 @@
+@@ -5709,6 +6275,69 @@
      memdescDestroy(pKernelGsp->pSignatureMemdesc);
      pKernelGsp->pSignatureMemdesc = NULL;
  

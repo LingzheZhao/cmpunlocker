@@ -30,23 +30,28 @@ require_root() {
 }
 
 supported_gpus() {
+    local id output
     for id in 20c2 2082; do
-        lspci -D -d "10de:${id}" 2>/dev/null | awk '{print $1}'
+        output="$(lspci -D -d "10de:${id}" 2>/dev/null)" || return 1
+        [[ -z "${output}" ]] || awk '{print $1}' <<< "${output}"
     done
 }
 
 link_generation() {
-    local status
-    status="$(setpci -s "$1" CAP_EXP+12.w 2>/dev/null || true)"
+    local status="$1" generation
     if [[ "${status}" =~ ^[[:xdigit:]]{4}$ ]]; then
-        echo $((0x${status} & 0x0f))
-    else
-        echo "?"
+        generation=$((0x${status} & 0x0f))
+        if (( generation >= 1 && generation <= 7 )); then
+            echo "${generation}"
+            return 0
+        fi
     fi
+    echo "?"
 }
 
 install_service() {
     local module="/lib/modules/$(uname -r)/updates/cmpunlocker/nvidia.ko"
+    local gpu_output
     local -a gpus=()
 
     require_root
@@ -56,7 +61,8 @@ install_service() {
     [[ -f "${HAMMER_SOURCE}" ]] || die "Missing ${HAMMER_SOURCE}"
     [[ -f "${SERVICE_SOURCE}" ]] || die "Missing ${SERVICE_SOURCE}"
 
-    mapfile -t gpus < <(supported_gpus)
+    gpu_output="$(supported_gpus)" || die "lspci failed while enumerating supported GPUs"
+    mapfile -t gpus < <(printf '%s' "${gpu_output}")
     [[ ${#gpus[@]} -gt 0 ]] || die "No supported CMP 170HX found (10de:20c2 / 10de:2082)"
     info "Detected: ${gpus[*]}"
 
@@ -100,35 +106,65 @@ show_status() {
 }
 
 verify_links() {
-    local gpu bridge status generation speed width max_speed result
+    local gpu bridge status generation speed width max_speed result smi_summary gpu_output
     local failures=0
+    local indeterminate=0
     local -a gpus=()
 
     require_root
-    mapfile -t gpus < <(supported_gpus)
-    [[ ${#gpus[@]} -gt 0 ]] || die "No supported CMP 170HX found"
+    if ! command -v lspci >/dev/null || ! command -v setpci >/dev/null; then
+        err "lspci/setpci are unavailable; PCIe generation cannot be measured"
+        printf '%s\n' "PCIe verification result: INDETERMINATE"
+        return 2
+    fi
+    if ! gpu_output="$(supported_gpus)"; then
+        err "lspci failed while enumerating supported GPUs"
+        printf '%s\n' "PCIe verification result: INDETERMINATE"
+        return 2
+    fi
+    mapfile -t gpus < <(printf '%s' "${gpu_output}")
+    if [[ ${#gpus[@]} -eq 0 ]]; then
+        err "No supported CMP 170HX could be enumerated"
+        printf '%s\n' "PCIe verification result: INDETERMINATE"
+        return 2
+    fi
 
     printf '%-16s %-16s %-8s %-14s %-8s %s\n'         "GPU" "Upstream" "LnkSta" "Current speed" "Width" "Result"
     for gpu in "${gpus[@]}"; do
         bridge="$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/${gpu}")")")"
-        status="$(setpci -s "${gpu}" CAP_EXP+12.w 2>/dev/null || echo unreadable)"
-        generation="$(link_generation "${gpu}")"
+        if status="$(setpci -s "${gpu}" CAP_EXP+12.w 2>/dev/null)"; then
+            generation="$(link_generation "${status}")"
+        else
+            status="unreadable"
+            generation="?"
+        fi
         speed="$(cat "/sys/bus/pci/devices/${gpu}/current_link_speed" 2>/dev/null || echo unknown)"
         width="$(cat "/sys/bus/pci/devices/${gpu}/current_link_width" 2>/dev/null || echo unknown)"
         max_speed="$(cat "/sys/bus/pci/devices/${gpu}/max_link_speed" 2>/dev/null || echo unknown)"
         if [[ "${generation}" =~ ^[0-9]+$ ]] && (( generation >= 2 )); then
             result="GEN2 OK"
-        else
+        elif [[ "${generation}" =~ ^[0-9]+$ ]]; then
             result="GEN1"
             failures=$((failures + 1))
+        else
+            result="UNKNOWN"
+            indeterminate=$((indeterminate + 1))
         fi
         printf '%-16s %-16s %-8s %-14s x%-7s %s\n'             "${gpu}" "${bridge}" "0x${status}" "${speed}" "${width}" "${result}"
         info "${gpu}: sysfs max=${max_speed}; negotiated generation is authoritative"
     done
 
-    if command -v nvidia-smi >/dev/null; then
+    if command -v nvidia-smi >/dev/null && command -v timeout >/dev/null; then
         echo
-        nvidia-smi             --query-gpu=pci.bus_id,memory.total,pcie.link.gen.current,pcie.link.gen.max             --format=csv 2>/dev/null || true
+        if smi_summary="$(timeout 10s nvidia-smi \
+            --query-gpu=pci.bus_id,memory.total,pcie.link.gen.current,pcie.link.gen.max \
+            --format=csv 2>/dev/null)" && [[ -n "${smi_summary}" ]]; then
+            printf '%s\n' "${smi_summary}"
+        else
+            warn "nvidia-smi summary is unavailable or timed out; skipping informational display"
+        fi
+    elif command -v nvidia-smi >/dev/null; then
+        warn "timeout command is unavailable; skipping optional nvidia-smi display"
     fi
 
     echo
@@ -140,9 +176,17 @@ verify_links() {
     fi
 
     if (( failures > 0 )); then
-        die "${failures} GPU(s) are still negotiated at Gen1"
+        err "${failures} GPU(s) are still negotiated at Gen1"
+        printf '%s\n' "PCIe verification result: GEN1"
+        return 1
+    fi
+    if (( indeterminate > 0 )); then
+        err "PCIe generation is unreadable for ${indeterminate} GPU(s)"
+        printf '%s\n' "PCIe verification result: INDETERMINATE"
+        return 2
     fi
     ok "All supported GPUs are negotiated at Gen2 or better"
+    printf '%s\n' "PCIe verification result: OK"
 }
 
 case "${1:-}" in
