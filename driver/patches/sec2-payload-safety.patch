@@ -1,0 +1,537 @@
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -25,6 +25,7 @@
+ 
+ #include "gpu/gsp/kernel_gsp.h"
+ #include "gpu/falcon/kernel_falcon.h"
++#include "gpu/sec2/kernel_sec2.h"
+ 
+ #include "kernel/core/thread_state.h"
+ #include "kernel/core/locks.h"
+@@ -5099,6 +5100,24 @@
+     NV_ASSERT_OR_RETURN(pbRetry != NULL, NV_ERR_INVALID_ARGUMENT);
+     *pbRetry = NV_FALSE;
+ 
++    if (_kgspSec2PostblTimingEnabled(pGpu))
++    {
++        KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
++
++        if (pKernelSec2 == NULL)
++            return NV_ERR_INVALID_STATE;
++
++        status = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++        if (status != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: SEC2 reset before GSP boot attempt "
++                      "failed (0x%x); refusing metadata mutation\n",
++                      status);
++            return status;
++        }
++    }
++
+     // Fail early if WPR2 is up
+     if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp) &&
+         (!pGpu->getProperty(pGpu, PDB_PROP_GPU_PREINITIALIZED_WPR_REGION)))
+@@ -5551,12 +5570,19 @@
+         // Increment the bootAttempt counter only on failure to boot GSP
+         pKernelGsp->bootAttempts++;
+-        if (gpuCheckEccCounts_HAL(pGpu) || bEccDisabled)
++        if (!_kgspSec2PostblTimingEnabled(pGpu) &&
++            (gpuCheckEccCounts_HAL(pGpu) || bEccDisabled))
+         {
+             *pbRetry = NV_TRUE;
+ 
+             // Persistently track next attempt so that subsequent boots can pick up where it left off.
+             if (bEccDisabled)
+                 osWriteRegistryDword(pGpu, NV_REG_STR_RM_GSP_BOOT_INITIAL_SHIFT, pKernelGsp->bootAttempts);
+         }
++        else if (_kgspSec2PostblTimingEnabled(pGpu))
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: refusing automatic retry after failed "
++                      "target GSP bootstrap\n");
++        }
+     }
+ 
+@@ -5563,8 +5589,72 @@
+     //
+     if (bRelaxedLocking)
+-        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+-                              _kgspBootReacquireLocks(pGpu, pKernelGsp, pGpusLockedMask));
++    {
++        NV_STATUS lockStatus =
++            _kgspBootReacquireLocks(pGpu, pKernelGsp, pGpusLockedMask);
++
++        if (lockStatus != NV_OK)
++        {
++            if (_kgspSec2PostblTimingEnabled(pGpu))
++            {
++                *pbRetry = NV_FALSE;
++                pKernelGsp->bFatalError = NV_TRUE;
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: failed to reacquire locks after target "
++                          "GSP bootstrap (0x%x); deferring resource release "
++                          "until destructor revalidation\n",
++                          lockStatus);
++            }
++            return lockStatus;
++        }
++    }
++
++    if (_kgspSec2PostblTimingEnabled(pGpu) && status != NV_OK)
++    {
++        NV_STATUS cleanupStatus;
++
++        *pbRetry = NV_FALSE;
++        cleanupStatus = kflcnReset_HAL(
++            pGpu, staticCast(pKernelGsp, KernelFalcon));
++        if (cleanupStatus != NV_OK)
++        {
++            pKernelGsp->bFatalError = NV_TRUE;
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: GSP reset after target bootstrap failure "
++                      "failed (0x%x); deferring resource release until "
++                      "destructor revalidation\n",
++                      cleanupStatus);
++            return cleanupStatus;
++        }
++
++        cleanupStatus = kgspExecuteBooterUnloadIfNeeded_HAL(
++            pGpu, pKernelGsp, 0ULL);
++        if (cleanupStatus != NV_OK)
++        {
++            pKernelGsp->bFatalError = NV_TRUE;
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: Booter Unload after target bootstrap failure "
++                      "failed (0x%x); deferring resource release until "
++                      "destructor revalidation\n",
++                      cleanupStatus);
++            return cleanupStatus;
++        }
++
++        if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp))
++        {
++            pKernelGsp->bFatalError = NV_TRUE;
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: WPR2 remains active after target bootstrap "
++                      "cleanup; deferring resource release until destructor "
++                      "revalidation\n");
++            return NV_ERR_RESET_REQUIRED;
++        }
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: target bootstrap cleanup stopped GSP and "
++                  "lowered WPR2; automatic retry remains disabled\n");
++    }
++
+ 
+     return status;
+ }
+ 
+@@ -6012,6 +6097,57 @@
+     if (!IS_GSP_CLIENT(pGpu))
+         return;
+ 
++    if (_kgspSec2PostblTimingEnabled(pGpu))
++    {
++        KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
++        NV_STATUS resetStatus;
++
++        resetStatus = kflcnReset_HAL(
++            pGpu, staticCast(pKernelGsp, KernelFalcon));
++        if (resetStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: GSP teardown reset failed (0x%x); "
++                      "retaining all GSP resources until cold power-off\n",
++                      resetStatus);
++            _kgspStopLogPolling(pGpu, pKernelGsp);
++            nvlogDeregisterFlushCb(kgspNvlogFlushCb, pKernelGsp);
++            return;
++        }
++
++        if (pKernelSec2 == NULL)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: cannot quiesce SEC2 during teardown; "
++                      "retaining all GSP resources until cold power-off\n");
++            _kgspStopLogPolling(pGpu, pKernelGsp);
++            nvlogDeregisterFlushCb(kgspNvlogFlushCb, pKernelGsp);
++            return;
++        }
++
++        resetStatus = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++        if (resetStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: SEC2 teardown reset failed (0x%x); "
++                      "retaining all GSP resources until cold power-off\n",
++                      resetStatus);
++            _kgspStopLogPolling(pGpu, pKernelGsp);
++            nvlogDeregisterFlushCb(kgspNvlogFlushCb, pKernelGsp);
++            return;
++        }
++
++        if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp))
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: WPR2 remains active during teardown; "
++                      "retaining all GSP resources until cold power-off\n");
++            _kgspStopLogPolling(pGpu, pKernelGsp);
++            nvlogDeregisterFlushCb(kgspNvlogFlushCb, pKernelGsp);
++            return;
++        }
++    }
++
+     // set VBIOS version string back to "unknown"
+     portStringCopy(pKernelGsp->vbiosVersionStr, sizeof(pKernelGsp->vbiosVersionStr), "unknown", sizeof("unknown"));
+ 
+@@ -6378,6 +6426,50 @@
+     pKernelGsp->gspRmBootUcodeSize   = 0;
+ }
+ 
++static NV_STATUS
++_kgspSec2PostblTimingEnsurePayloadMemdesc
++(
++    OBJGPU *pGpu,
++    KernelGsp *pKernelGsp
++)
++{
++    NV_STATUS status = NV_OK;
++    NvU64 flags = MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
++    MEMORY_DESCRIPTOR *pNewSignatureMemdesc = NULL;
++
++    if (pKernelGsp->pSignatureMemdesc != NULL &&
++        memdescGetSize(pKernelGsp->pSignatureMemdesc) >= SEC2_POSTBL_TIMING_SIGNATURE_SIZE)
++    {
++        return NV_OK;
++    }
++
++    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
++        memdescCreate(&pNewSignatureMemdesc, pGpu,
++            SEC2_POSTBL_TIMING_SIGNATURE_SIZE, 256,
++            NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
++
++    memdescTagAlloc(status,
++        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16,
++        pNewSignatureMemdesc);
++    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail_create);
++
++    if (pKernelGsp->pSignatureMemdesc != NULL)
++    {
++        memdescFree(pKernelGsp->pSignatureMemdesc);
++        memdescDestroy(pKernelGsp->pSignatureMemdesc);
++    }
++
++    pKernelGsp->pSignatureMemdesc = pNewSignatureMemdesc;
++    NV_PRINTF(LEVEL_ERROR,
++              "SEC2_DEBUG: rebuilt 0x%llx-byte post-BL payload for retry\n",
++              SEC2_POSTBL_TIMING_SIGNATURE_SIZE);
++    return NV_OK;
++
++fail_create:
++    memdescDestroy(pNewSignatureMemdesc);
++    return status;
++}
++
+ static void
+ _kgspSec2PostblTimingPutU32(NvU8 *pBuffer, NvU32 offset, NvU32 value)
+ {
+@@ -6387,13 +6479,21 @@
+     pBuffer[offset + 3] = (NvU8)(value >> 24);
+ }
+ 
+-static void
++static NV_STATUS
+ _kgspSec2PostblTimingFillPayload(NvU8 *pSignatureVa, NvU64 signatureSize,
+                                 NvU32 writeAddr, NvU32 writeValue)
+ {
+     NvU64 i;
+ 
+-    for (i = 0; i + sizeof(NvU32) <= signatureSize; i += sizeof(NvU32))
++    if (pSignatureVa == NULL ||
++        signatureSize < SEC2_POSTBL_TIMING_SIGNATURE_SIZE)
++    {
++        return NV_ERR_BUFFER_TOO_SMALL;
++    }
++
++    for (i = 0;
++         i + sizeof(NvU32) <= SEC2_POSTBL_TIMING_SIGNATURE_SIZE;
++         i += sizeof(NvU32))
+         _kgspSec2PostblTimingPutU32(pSignatureVa, (NvU32)i, SEC2_POSTBL_TIMING_FILL_DWORD);
+ 
+     _kgspSec2PostblTimingPutU32(pSignatureVa, 0x1100, 0x00000007U);
+@@ -6421,6 +6521,8 @@
+     _kgspSec2PostblTimingPutU32(pSignatureVa, 0xf7e0, 0x00001fbdU);
+     _kgspSec2PostblTimingPutU32(pSignatureVa, 0xf7f4, 0x00000ccbU);
+     _kgspSec2PostblTimingPutU32(pSignatureVa, 0xf7f8, 0x00007f2fU);
++
++    return NV_OK;
+ }
+ 
+ NV_STATUS
+@@ -6428,18 +6530,36 @@
+                                  NvU32 writeAddr, NvU32 writeValue)
+ {
+     NvU8 *pSignatureVa;
++    NV_STATUS status;
++    KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
+ 
+-    if (pKernelGsp->pSignatureMemdesc == NULL)
++    if (pKernelSec2 == NULL)
+         return NV_ERR_INVALID_STATE;
+ 
++    status = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++    if (status != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: SEC2 reset before post-BL payload refill "
++                  "failed (0x%x); retaining current payload\n",
++                  status);
++        return status;
++    }
++
++    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
++        _kgspSec2PostblTimingEnsurePayloadMemdesc(pGpu, pKernelGsp));
++
+     pSignatureVa = memdescMapInternal(pGpu, pKernelGsp->pSignatureMemdesc, TRANSFER_FLAGS_NONE);
+     if (pSignatureVa == NULL)
+         return NV_ERR_INSUFFICIENT_RESOURCES;
+ 
+-    _kgspSec2PostblTimingFillPayload(pSignatureVa,
++    status = _kgspSec2PostblTimingFillPayload(pSignatureVa,
+         memdescGetSize(pKernelGsp->pSignatureMemdesc), writeAddr, writeValue);
+ 
+     memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
++    if (status != NV_OK)
++        return status;
++
+     memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
+ 
+     if (pKernelGsp->pWprMeta != NULL)
+@@ -6466,6 +6586,8 @@
+ {
+     NV_STATUS status = NV_OK;
+     NvU8 *pSignatureVa = NULL;
++    NvU8 *pNewStockSignatureData = NULL;
++    NvU64 newStockSignatureSize = 0;
+     NvBool bPostbl = _kgspSec2PostblTimingEnabled(pGpu);
+     NvU64 sigSize = bPostbl ? SEC2_POSTBL_TIMING_SIGNATURE_SIZE
+                             : NV_ALIGN_UP(pGspFw->signatureSize, 256);
+@@ -6486,6 +6608,25 @@
+             NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pKernelGsp->pSignatureMemdesc);
+     NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail_create);
+ 
++    if (bPostbl)
++    {
++        if (pGspFw->pSignatureData == NULL || pGspFw->signatureSize == 0)
++        {
++            status = NV_ERR_INVALID_STATE;
++            goto fail_alloc;
++        }
++
++        pNewStockSignatureData = portMemAllocNonPaged(pGspFw->signatureSize);
++        if (pNewStockSignatureData == NULL)
++        {
++            status = NV_ERR_INSUFFICIENT_RESOURCES;
++            goto fail_alloc;
++        }
++        newStockSignatureSize = pGspFw->signatureSize;
++        portMemCopy(pNewStockSignatureData, newStockSignatureSize,
++                    pGspFw->pSignatureData, pGspFw->signatureSize);
++    }
++
+     pSignatureVa = memdescMapInternal(pGpu, pKernelGsp->pSignatureMemdesc, TRANSFER_FLAGS_NONE);
+     NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+         (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+@@ -6495,20 +6636,6 @@
+     {
+         NV_STATUS dmemStatus;
+ 
+-        if (pGspFw->pSignatureData != NULL && pGspFw->signatureSize > 0)
+-        {
+-            pKernelGsp->stockSignatureSize = pGspFw->signatureSize;
+-            pKernelGsp->pStockSignatureData = portMemAllocNonPaged(pGspFw->signatureSize);
+-            if (pKernelGsp->pStockSignatureData != NULL)
+-            {
+-                portMemCopy(pKernelGsp->pStockSignatureData, pGspFw->signatureSize,
+-                            pGspFw->pSignatureData, pGspFw->signatureSize);
+-                NV_PRINTF(LEVEL_ERROR,
+-                          "SEC2_DEBUG: saved stock signature (%llu bytes)\n",
+-                          (unsigned long long)pGspFw->signatureSize);
+-            }
+-        }
+-
+         dmemStatus = os_open_and_read_file(
+             SEC2_POSTBL_TIMING_DMEM_PATH, pSignatureVa, sigSize);
+         if (dmemStatus == NV_OK)
+@@ -6522,9 +6649,16 @@
+             NV_PRINTF(LEVEL_ERROR,
+                       "SEC2_DEBUG: %s not found (0x%x), using built-in payload\n",
+                       SEC2_POSTBL_TIMING_DMEM_PATH, dmemStatus);
+-            _kgspSec2PostblTimingFillPayload(pSignatureVa,
++            dmemStatus = _kgspSec2PostblTimingFillPayload(pSignatureVa,
+                 memdescGetSize(pKernelGsp->pSignatureMemdesc),
+                 0x009a0148U, 0xffffffffU);
++            if (dmemStatus != NV_OK)
++            {
++                memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
++                pSignatureVa = NULL;
++                status = dmemStatus;
++                goto fail_alloc;
++            }
+         }
+         memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
+     }
+@@ -6537,9 +6671,25 @@
+     memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
+     pSignatureVa = NULL;
+ 
++    if (bPostbl)
++    {
++        NvU8 *pOldStockSignatureData = pKernelGsp->pStockSignatureData;
++
++        pKernelGsp->pStockSignatureData = pNewStockSignatureData;
++        pKernelGsp->stockSignatureSize = newStockSignatureSize;
++        pNewStockSignatureData = NULL;
++        if (pOldStockSignatureData != NULL)
++            portMemFree(pOldStockSignatureData);
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: saved stock signature (%llu bytes)\n",
++                  (unsigned long long)newStockSignatureSize);
++    }
++
+     return status;
+ 
+ fail_alloc:
++    if (pNewStockSignatureData != NULL)
++        portMemFree(pNewStockSignatureData);
+     memdescFree(pKernelGsp->pSignatureMemdesc);
+ 
+ fail_create:
+@@ -6556,12 +6706,26 @@
+     NvU8 *pSignatureVa = NULL;
+     NvU64 sigSize;
+     NvU64 flags = MEMDESC_FLAGS_NONE;
++    KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
+ 
+     if (pKernelGsp->pStockSignatureData == NULL || pKernelGsp->stockSignatureSize == 0)
+         return NV_ERR_INVALID_STATE;
+ 
+     if (pKernelGsp->pSignatureMemdesc != NULL)
+     {
++        if (pKernelSec2 == NULL)
++            return NV_ERR_INVALID_STATE;
++
++        status = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++        if (status != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: SEC2 reset before stock payload rebuild "
++                      "failed (0x%x); retaining post-BL payload\n",
++                      status);
++            return status;
++        }
++
+         memdescFree(pKernelGsp->pSignatureMemdesc);
+         memdescDestroy(pKernelGsp->pSignatureMemdesc);
+         pKernelGsp->pSignatureMemdesc = NULL;
+--- a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
++++ b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
+@@ -312,6 +312,12 @@
+         memdescDestroy(pKernelGsp->pSignatureMemdesc);
+         pKernelGsp->pSignatureMemdesc = NULL;
+     }
++    if (pKernelGsp->pStockSignatureData != NULL)
++    {
++        portMemFree(pKernelGsp->pStockSignatureData);
++        pKernelGsp->pStockSignatureData = NULL;
++        pKernelGsp->stockSignatureSize = 0;
++    }
+ 
+     // Release sysmem heap memory
+     if (pKernelGsp->pSysmemHeapDescriptor != NULL)
+--- a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c
++++ b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c
+@@ -87,6 +87,7 @@
+ )
+ {
+     NV_STATUS status;
++    NV_STATUS resetStatus;
+     NvU32 mailbox0 = 0, mailbox1 = 0;
+ 
+     KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
+@@ -106,7 +107,13 @@
+     NV_PRINTF(LEVEL_INFO, "executing Booter Load, sysmemAddrOfData 0x%llx\n",
+               sysmemAddrOfData);
+ 
+-    NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon)));
++    resetStatus = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++    if (resetStatus != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "failed to reset SEC2 before Booter Load: 0x%x\n", resetStatus);
++        return resetStatus;
++    }
+ 
+     status = s_executeBooterUcode_TU102(pGpu, pKernelGsp,
+                                         pKernelGsp->pBooterLoadUcode,
+@@ -114,6 +121,16 @@
+                                         mailbox0, mailbox1);
+     if (status != NV_OK)
+     {
++        resetStatus = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++        if (resetStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2 reset after Booter Load failure also failed: 0x%x; "
++                      "Booter DMA state is not quiesced\n",
++                      resetStatus);
++            return resetStatus;
++        }
++
+         NV_PRINTF(LEVEL_ERROR, "failed to execute Booter Load: 0x%x\n", status);
+         return status;
+     }
+@@ -130,6 +147,7 @@
+ )
+ {
+     NV_STATUS status;
++    NV_STATUS resetStatus;
+     KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
+     NvU32 mailbox0 = 0xFF, mailbox1 = 0xFF;
+ 
+@@ -151,7 +169,14 @@
+     NV_PRINTF(LEVEL_INFO, "executing Booter Unload\n");
+     NV_ASSERT_OR_RETURN(pKernelGsp->pBooterUnloadUcode != NULL, NV_ERR_INVALID_STATE);
+ 
+-    NV_ASSERT_OK(kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon)));
++    resetStatus = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++    if (resetStatus != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "failed to reset SEC2 before Booter Unload: 0x%x\n",
++                  resetStatus);
++        return resetStatus;
++    }
+ 
+     // SR code
+     if (sysmemAddrOfSuspendResumeData != 0)
+@@ -165,6 +190,16 @@
+                                         mailbox0, mailbox1);
+     if (status != NV_OK)
+     {
++        resetStatus = kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon));
++        if (resetStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2 reset after Booter Unload failure also failed: "
++                      "0x%x; Booter DMA state is not quiesced\n",
++                      resetStatus);
++            return resetStatus;
++        }
++
+         NV_PRINTF(LEVEL_ERROR, "failed to execute Booter Unload: 0x%x\n", status);
+         return status;
+     }

@@ -55,7 +55,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c b/src/
  
          // Load init args into mailbox regs
          kgspProgramLibosBootArgsAddr_HAL(pGpu, pKernelGsp);
-@@ -565,6 +588,29 @@
+@@ -565,6 +588,45 @@
      // Execute Booter Load
      status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
                                         _kgspGetBooterLoadArgs(pKernelGsp, bootMode));
@@ -69,16 +69,32 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c b/src/
 +
 +    {
 +        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-+        if ((devId == 0x20C2 || devId == 0x2082) && status == NV_OK)
++        if ((devId == 0x20C2 || devId == 0x2082) &&
++            bootMode == KGSP_BOOT_MODE_NORMAL && status == NV_OK)
 +        {
++            NvU32 cfg1Expected = (devId == 0x20C2) ? 0x02779000U : 0x02669000U;
++            NvU32 lmrExpected = (devId == 0x20C2) ? 0x0000020BU : 0x0000028AU;
++            NvU32 featPlm = GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_PLM);
++            NvU32 ss0 = GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED);
++            NvU32 ss1 = GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1);
++            NvU32 cfg1 = GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FBPA_CFG1);
++            NvU32 lmr = GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_MMU_LMR);
++
 +            NV_PRINTF(LEVEL_ERROR,
 +                      "SEC2_DEBUG: POST-BooterLoad verify PLM=0x%08x SS0=0x%08x SS1=0x%08x "
 +                      "CFG1=0x%08x LMR=0x%08x\n",
-+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_PLM),
-+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED),
-+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1),
-+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FBPA_CFG1),
-+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_MMU_LMR));
++                      featPlm, ss0, ss1, cfg1, lmr);
++
++            if (featPlm != 0xffffffffU || ss0 != 0x88888888U ||
++                ss1 != 0x00000008U || cfg1 != cfg1Expected || lmr != lmrExpected)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: POST-BooterLoad verification failed; "
++                          "expected PLM/SS0/SS1/CFG1/LMR="
++                          "ffffffff/88888888/00000008/%08x/%08x\n",
++                          cfg1Expected, lmrExpected);
++                return NV_ERR_RESET_REQUIRED;
++            }
 +        }
 +    }
 +

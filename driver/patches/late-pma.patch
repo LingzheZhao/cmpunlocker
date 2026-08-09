@@ -1,38 +1,346 @@
-diff -Naur a/src/nvidia/arch/nvalloc/unix/src/osinit.c b/src/nvidia/arch/nvalloc/unix/src/osinit.c
---- a/src/nvidia/arch/nvalloc/unix/src/osinit.c	2026-07-18 11:26:26.875698119 -0700
-+++ b/src/nvidia/arch/nvalloc/unix/src/osinit.c	2026-07-18 11:26:26.876734803 -0700
-@@ -2195,6 +2195,18 @@
-         goto shutdown;
-     }
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+@@ -1053,6 +1053,37 @@
+     return status;
+ }
  
-+    if (pGpu != NULL)
++#define CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM 6U
++
++static NV_STATUS
++_memmgrCmpValidatePreHeapRegionState
++(
++    NvU32  devId,
++    NvU32  numFbRegions,
++    NvU32  maxFbRegions,
++    NvBool bVirtual,
++    NvBool bNumaOnlining,
++    NvBool bSizeOverrideActive,
++    NvU64  overrideHeapMax,
++    NvU64  overrideInitHeapMin
++)
++{
++    if (devId != 0x20C2 && devId != 0x2082)
++        return NV_OK;
++
++    if (maxFbRegions <= CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM ||
++        bVirtual || bNumaOnlining || bSizeOverrideActive ||
++        overrideHeapMax != ~0ULL || overrideInitHeapMin != 0 ||
++        numFbRegions == 0 ||
++        numFbRegions >
++            maxFbRegions - CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM)
 +    {
-+        NvU32 devId = (pGpu->idInfo.PCIDeviceID) >> 16;
-+        if (devId == 0x20C2 || devId == 0x2082)
++        return NV_ERR_INVALID_STATE;
++    }
++
++    return NV_OK;
++}
++
+ NV_STATUS
+ memmgrCreateHeap_IMPL
+ (
+@@ -1085,6 +1116,40 @@
+     // for vGPU, add extra FB tax incurred by host RM to reserved size
+     rsvdSize += memmgrGetFbTaxSize_HAL(pGpu, pMemoryManager);
+ 
++    {
++        NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;
++
++        status = _memmgrCmpValidatePreHeapRegionState(
++            cmpDevId,
++            pMemoryManager->Ram.numFBRegions,
++            MAX_FB_REGIONS,
++            IS_VIRTUAL(pGpu),
++            osNumaOnliningEnabled(pGpu->pOsGpuInfo),
++            pMemoryManager->Ram.fbTotalMemSizeMb >
++                pMemoryManager->Ram.fbOverrideSizeMb,
++            pMemoryManager->overrideHeapMax,
++            pMemoryManager->overrideInitHeapMin);
++        if (status != NV_OK)
 +        {
-+            NV_STATUS latePmaStatus =
-+                memmgrSec2DebugLateExtendHighPmaRegion(pGpu, GPU_GET_MEMORY_MANAGER(pGpu));
 +            NV_PRINTF(LEVEL_ERROR,
-+                      "SEC2_DEBUG: late PMA extension status=0x%x\n", latePmaStatus);
++                      "SEC2_DEBUG_PMA_GUARD: unsupported pre-heap "
++                      "region transform state count=%u max=%u "
++                      "headroom=%u virtual=%u numa=%u sizeOverride=%u "
++                      "overrideHeapMax=0x%llx overrideInitHeapMin=0x%llx; "
++                      "refusing heap init\n",
++                      pMemoryManager->Ram.numFBRegions,
++                      MAX_FB_REGIONS,
++                      CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM,
++                      IS_VIRTUAL(pGpu),
++                      osNumaOnliningEnabled(pGpu->pOsGpuInfo),
++                      pMemoryManager->Ram.fbTotalMemSizeMb >
++                          pMemoryManager->Ram.fbOverrideSizeMb,
++                      pMemoryManager->overrideHeapMax,
++                      pMemoryManager->overrideInitHeapMin);
++            return status;
 +        }
 +    }
 +
      //
-     // Expanded GPU visibility in GPUMGR is no longer needed once the
-     // GPU is initialized.
-diff -Naur a/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h b/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h
---- a/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h	2026-07-18 11:26:26.869459809 -0700
-+++ b/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h	2026-07-18 11:26:26.870506938 -0700
-@@ -1,3 +1,5 @@
+     // Fix up region descriptions to match with any FB override size
+     //
+@@ -1120,9 +1185,260 @@
  
- #include "g_mem_mgr_nvoc.h"
- 
-+NV_STATUS memmgrSec2DebugLateExtendHighPmaRegion(OBJGPU *pGpu, MemoryManager *pMemoryManager);
+         if ((memmgrIsPmaInitialized(pMemoryManager)) && (pMemoryManager->pHeap->bHasFbRegions))
+         {
++            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++            NvU64 validatedProtectedStart = 0;
++            NvU64 validatedFbSize = 0;
++            NvU64 validatedPublicBytes = 0;
++            if (devId == 0x20C2 || devId == 0x2082)
++            {
++                KernelGsp *pKernelGsp = GPU_GET_KERNEL_GSP(pGpu);
++                GspFwWprMeta *pWprMeta =
++                    (pKernelGsp != NULL) ? pKernelGsp->pWprMeta : NULL;
++                NvU64 fbAddrSpaceBytes = pMemoryManager->Ram.fbAddrSpaceSizeMb << 20;
++                NvU64 targetFbBytes = (devId == 0x20C2) ?
++                    0x0000001000000000ULL : 0x0000000A00000000ULL;
++                NvU64 expectedBase = 0;
++                NvU64 regionBytes = 0;
++                NvU64 nativePublicBytes = 0;
++                NvU64 pmaPublicBytes = 0;
++                NvU64 heapEndExclusive = 0;
++                NvU32 regionIdx;
++                NvU32 pmaConfig = PMA_QUERY_NUMA_ONLINED;
 +
-diff -Naur a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
---- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c	2026-07-18 11:26:26.862962399 -0700
-+++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c	2026-07-18 11:26:26.864088597 -0700
-@@ -1163,6 +1163,35 @@
++                if (pWprMeta == NULL ||
++                    pKernelGsp->pWprMetaDescriptor == NULL ||
++                    memdescGetSize(pKernelGsp->pWprMetaDescriptor) < sizeof(*pWprMeta))
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: WPR metadata unavailable or truncated; "
++                              "refusing PMA registration\n");
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                if (pWprMeta->magic != GSP_FW_WPR_META_MAGIC ||
++                    pWprMeta->revision != GSP_FW_WPR_META_REVISION ||
++                    pWprMeta->fbSize != targetFbBytes ||
++                    fbAddrSpaceBytes != targetFbBytes ||
++                    pWprMeta->gspFwRsvdStart == 0 ||
++                    pWprMeta->gspFwRsvdStart >= pWprMeta->fbSize ||
++                    (pWprMeta->gspFwRsvdStart & 0xffffULL) != 0 ||
++                    pWprMeta->gspFwRsvdStart != pWprMeta->nonWprHeapOffset ||
++                    pWprMeta->gspFwWprStart == 0 ||
++                    pWprMeta->gspFwRsvdStart > pWprMeta->gspFwWprStart ||
++                    pWprMeta->nonWprHeapSize == 0 ||
++                    pWprMeta->nonWprHeapSize !=
++                        pWprMeta->gspFwWprStart - pWprMeta->nonWprHeapOffset ||
++                    pWprMeta->gspFwWprStart >= pWprMeta->gspFwWprEnd ||
++                    pWprMeta->gspFwWprEnd > pWprMeta->fbSize ||
++                    pWprMeta->gspFwHeapSize == 0 ||
++                    pWprMeta->gspFwHeapOffset < pWprMeta->gspFwWprStart ||
++                    pWprMeta->gspFwHeapOffset >= pWprMeta->gspFwWprEnd ||
++                    pWprMeta->gspFwHeapSize >
++                        pWprMeta->gspFwWprEnd - pWprMeta->gspFwHeapOffset)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: invalid layout "
++                              "magic=0x%llx revision=%llu protectedStart=0x%llx "
++                              "nonWpr=[0x%llx,+0x%llx) wpr=[0x%llx,0x%llx) "
++                              "heap=[0x%llx,+0x%llx) "
++                              "metaFbSize=0x%llx fbAddrSpace=0x%llx; "
++                              "refusing PMA registration\n",
++                              pWprMeta->magic,
++                              pWprMeta->revision,
++                              pWprMeta->gspFwRsvdStart,
++                              pWprMeta->nonWprHeapOffset,
++                              pWprMeta->nonWprHeapSize,
++                              pWprMeta->gspFwWprStart,
++                              pWprMeta->gspFwWprEnd,
++                              pWprMeta->gspFwHeapOffset,
++                              pWprMeta->gspFwHeapSize,
++                              pWprMeta->fbSize,
++                              fbAddrSpaceBytes);
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                if (pMemoryManager->pHeap->base >= pWprMeta->fbSize ||
++                    pMemoryManager->pHeap->total == 0 ||
++                    pMemoryManager->pHeap->total >
++                        pWprMeta->fbSize - pMemoryManager->pHeap->base)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: invalid heap range "
++                              "base=0x%llx total=0x%llx fbSize=0x%llx; "
++                              "refusing PMA registration\n",
++                              pMemoryManager->pHeap->base,
++                              pMemoryManager->pHeap->total,
++                              pWprMeta->fbSize);
++                    return NV_ERR_INVALID_STATE;
++                }
++                heapEndExclusive = pMemoryManager->pHeap->base +
++                                   pMemoryManager->pHeap->total;
++
++                if (pmaQueryConfigs(pMemoryManager->pHeap->pPmaObject,
++                                    &pmaConfig) != NV_OK ||
++                    (pmaConfig & PMA_QUERY_NUMA_ONLINED) != 0)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: PMA NUMA state cannot be "
++                              "validated exactly; refusing PMA registration\n");
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                if (pMemoryManager->Ram.numFBRegions == 0 ||
++                    pMemoryManager->Ram.numFBRegions > MAX_FB_REGIONS)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: invalid FB region count=%u; "
++                              "refusing PMA registration\n",
++                              pMemoryManager->Ram.numFBRegions);
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                for (regionIdx = 0;
++                     regionIdx < pMemoryManager->Ram.numFBRegions;
++                     regionIdx++)
++                {
++                    FB_REGION_DESCRIPTOR *pRegion =
++                        &pMemoryManager->Ram.fbRegion[regionIdx];
++                    NvU64 currentRegionBytes;
++                    NvU64 clippedBase;
++                    NvU64 clippedEndExclusive;
++                    if (pRegion->base > pRegion->limit ||
++                        pRegion->limit >= pWprMeta->fbSize ||
++                        pRegion->base != expectedBase ||
++                        (pRegion->base & 0xffffULL) != 0 ||
++                        ((pRegion->limit + 1) & 0xffffULL) != 0)
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG_PMA_GUARD: invalid region[%u] "
++                                  "base=0x%llx limit=0x%llx expectedBase=0x%llx "
++                                  "fbSize=0x%llx; refusing PMA registration\n",
++                                  regionIdx, pRegion->base, pRegion->limit,
++                                  expectedBase, pWprMeta->fbSize);
++                        return NV_ERR_INVALID_STATE;
++                    }
++
++                    currentRegionBytes = pRegion->limit - pRegion->base + 1;
++                    if (currentRegionBytes >
++                        pWprMeta->fbSize - regionBytes)
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG_PMA_GUARD: region byte accounting "
++                                  "overflow at region[%u]; refusing PMA registration\n",
++                                  regionIdx);
++                        return NV_ERR_INVALID_STATE;
++                    }
++                    if (pRegion->rsvdSize > currentRegionBytes ||
++                        (pRegion->bRsvdRegion &&
++                         pRegion->rsvdSize != currentRegionBytes) ||
++                        (!pRegion->bRsvdRegion && !pRegion->bInternalHeap &&
++                         (pRegion->rsvdSize != 0 || pRegion->bProtected)))
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG_PMA_GUARD: invalid region[%u] "
++                                  "flags/size reserved=0x%llx size=0x%llx "
++                                  "bRsvd=%u bInternal=%u bProtected=%u; "
++                                  "refusing PMA registration\n",
++                                  regionIdx, pRegion->rsvdSize,
++                                  currentRegionBytes, pRegion->bRsvdRegion,
++                                  pRegion->bInternalHeap, pRegion->bProtected);
++                        return NV_ERR_INVALID_STATE;
++                    }
++
++                    regionBytes += currentRegionBytes;
++                    expectedBase = pRegion->limit + 1;
++
++                    if (!pRegion->bRsvdRegion &&
++                        pRegion->limit >= pWprMeta->gspFwRsvdStart)
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG_PMA_GUARD: non-reserved region[%u] "
++                                  "base=0x%llx limit=0x%llx overlaps "
++                                  "protectedStart=0x%llx; refusing PMA registration\n",
++                                  regionIdx, pRegion->base, pRegion->limit,
++                                  pWprMeta->gspFwRsvdStart);
++                        return NV_ERR_INVALID_STATE;
++                    }
++                    if (!pRegion->bRsvdRegion && !pRegion->bInternalHeap &&
++                        !pRegion->bProtected)
++                    {
++                        nativePublicBytes += currentRegionBytes;
++                        clippedBase = NV_MAX(pRegion->base,
++                                             pMemoryManager->pHeap->base);
++                        clippedEndExclusive = NV_MIN(pRegion->limit + 1,
++                                                     heapEndExclusive);
++                        if (clippedBase < clippedEndExclusive)
++                            pmaPublicBytes += clippedEndExclusive - clippedBase;
++                    }
++                }
++
++                if (expectedBase != pWprMeta->fbSize ||
++                    regionBytes != pWprMeta->fbSize ||
++                    nativePublicBytes < pWprMeta->fbSize - 0x80000000ULL ||
++                    pmaPublicBytes == 0)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: incomplete/insufficient FB map "
++                              "covered=0x%llx expectedEnd=0x%llx "
++                              "nativePublicBytes=0x%llx publicBytes=0x%llx "
++                              "minimumNativePublic=0x%llx; refusing PMA registration\n",
++                              regionBytes, expectedBase, nativePublicBytes,
++                              pmaPublicBytes,
++                              pWprMeta->fbSize - 0x80000000ULL);
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                {
++                    FB_REGION_DESCRIPTOR *pTopRegion =
++                        &pMemoryManager->Ram.fbRegion[
++                            pMemoryManager->Ram.numFBRegions - 1];
++                    NvU64 protectedBytes = pWprMeta->fbSize -
++                                           pWprMeta->gspFwRsvdStart;
++                    if (pTopRegion->base != pWprMeta->gspFwRsvdStart ||
++                        pTopRegion->limit + 1 != pWprMeta->fbSize ||
++                        !pTopRegion->bRsvdRegion ||
++                        pTopRegion->bInternalHeap ||
++                        pTopRegion->bProtected ||
++                        pTopRegion->rsvdSize != protectedBytes)
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG_PMA_GUARD: final protected "
++                                  "carveout is not exact; refusing PMA "
++                                  "registration\n");
++                        return NV_ERR_INVALID_STATE;
++                    }
++                }
++
++                validatedProtectedStart = pWprMeta->gspFwRsvdStart;
++                validatedFbSize = pWprMeta->fbSize;
++                validatedPublicBytes = pmaPublicBytes;
++            }
++
+             status = memmgrPmaRegisterRegions(pGpu, pMemoryManager, pMemoryManager->pHeap,
+                                               pMemoryManager->pHeap->pPmaObject);
+             NV_ASSERT_OR_RETURN(status == NV_OK, status);
++
++            if (devId == 0x20C2 || devId == 0x2082)
++            {
++                NvU64 pmaBytes = 0;
++                pmaGetTotalMemory(pMemoryManager->pHeap->pPmaObject, &pmaBytes);
++                if (pmaBytes != validatedPublicBytes)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG_PMA_GUARD: PMA total 0x%llx does not "
++                              "match validated public bytes 0x%llx; refusing init\n",
++                              pmaBytes, validatedPublicBytes);
++                    return NV_ERR_INVALID_STATE;
++                }
++
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG_PMA_GUARD: fbSize=0x%llx "
++                          "protectedStart=0x%llx publicBytes=0x%llx "
++                          "pmaBytes=0x%llx "
++                          "status=safe build=cmpunlocker-safety-v4\n",
++                          validatedFbSize, validatedProtectedStart,
++                          validatedPublicBytes, pmaBytes);
++            }
+         }
+ 
+         NV_ASSERT_OK_OR_RETURN(memmgrValidateFBEndReservation_HAL(pGpu, pMemoryManager));
+@@ -1163,6 +1479,35 @@
          }
  
          NV_ASSERT_OK_OR_RETURN(kmemsysPostHeapCreate_HAL(pGpu, pKernelMemorySystem));
@@ -68,189 +376,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c b/src/nvidia/src/kernel
      }
  
      return status;
-@@ -3646,6 +3675,181 @@
-     return status;
- }
- 
-+NV_STATUS
-+memmgrSec2DebugLateExtendHighPmaRegion
-+(
-+    OBJGPU        *pGpu,
-+    MemoryManager *pMemoryManager
-+)
-+{
-+    Heap *pHeap;
-+    PMA *pPma;
-+    PMA_REGION_DESCRIPTOR pmaRegion = {0};
-+    PMA_REGION_DESCRIPTOR *pFirstPmaRegionDesc = NULL;
-+    FB_REGION_DESCRIPTOR *pCandidate = NULL;
-+    NvU32 numPmaRegions = 0;
-+    NvU32 candidateIdx = MAX_FB_REGIONS;
-+    NvU64 pmaFreeBefore = 0, pmaTotalBefore = 0;
-+    NvU64 pmaFreeAfter = 0, pmaTotalAfter = 0;
-+    NvU64 heapFree = 0, heapTotal = 0;
-+    NvU32 devId;
-+    NvU64 stockFbBytes;
-+    NvU32 i;
-+    NV_STATUS status;
-+
-+    if (pGpu == NULL || pMemoryManager == NULL)
-+        return NV_ERR_INVALID_ARGUMENT;
-+
-+    devId = pGpu->idInfo.PCIDeviceID >> 16;
-+    if (devId != 0x20C2 && devId != 0x2082)
-+        return NV_OK;
-+
-+    stockFbBytes = 0x200000000ULL;
-+
-+    pHeap = pMemoryManager->pHeap;
-+    if (pHeap == NULL || pHeap->pPmaObject == NULL || !memmgrIsPmaInitialized(pMemoryManager))
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: no PMA, skipped heap=%p init=%u\n",
-+                  pHeap,
-+                  pHeap ? memmgrIsPmaInitialized(pMemoryManager) : 0);
-+        return NV_OK;
-+    }
-+
-+    pPma = pHeap->pPmaObject;
-+    heapGetFree(pHeap, &heapFree);
-+    heapGetSize(pHeap, &heapTotal);
-+    pmaGetFreeMemory(pPma, &pmaFreeBefore);
-+    pmaGetTotalMemory(pPma, &pmaTotalBefore);
-+
-+    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
-+    {
-+        FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: region[%u] base=0x%llx limit=0x%llx "
-+                  "rsvd=%u rsvdSize=0x%llx intHeap=%u\n",
-+                  i, pRegion->base, pRegion->limit,
-+                  pRegion->bRsvdRegion, pRegion->rsvdSize, pRegion->bInternalHeap);
-+    }
-+
-+    status = pmaGetRegionInfo(pPma, &numPmaRegions, &pFirstPmaRegionDesc);
-+    if (status != NV_OK)
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: pmaGetRegionInfo failed 0x%x\n", status);
-+        return status;
-+    }
-+
-+    NV_PRINTF(LEVEL_ERROR,
-+              "SEC2_DEBUG_LATE_PMA: numFBRegions=%u numPmaRegions=%u "
-+              "stockFb=0x%llx pma_total=0x%llx pma_free=0x%llx "
-+              "heap_total=0x%llx heap_free=0x%llx\n",
-+              pMemoryManager->Ram.numFBRegions, numPmaRegions,
-+              stockFbBytes, pmaTotalBefore, pmaFreeBefore,
-+              heapTotal, heapFree);
-+
-+    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
-+    {
-+        FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
-+        if (pRegion->bRsvdRegion && !pRegion->bInternalHeap &&
-+            pRegion->limit >= stockFbBytes && pRegion->base <= pRegion->limit &&
-+            (pCandidate == NULL || pRegion->limit > pCandidate->limit))
-+        {
-+            pCandidate = pRegion;
-+            candidateIdx = i;
-+        }
-+    }
-+
-+    if (pCandidate == NULL)
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: no high reserved region found "
-+                  "(looking for bRsvdRegion && limit>=0x%llx)\n",
-+                  stockFbBytes);
-+        return NV_OK;
-+    }
-+
-+    pmaRegion.base = NV_MAX(pCandidate->base, stockFbBytes);
-+    pmaRegion.limit = pCandidate->limit;
-+    pmaRegion.performance = pCandidate->performance;
-+    pmaRegion.bSupportCompressed = NV_TRUE;
-+    pmaRegion.bSupportISO = pCandidate->bSupportISO;
-+    pmaRegion.bProtected = pCandidate->bProtected;
-+
-+    if (pmaRegion.base > pmaRegion.limit)
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: empty range base=0x%llx > limit=0x%llx\n",
-+                  pmaRegion.base, pmaRegion.limit);
-+        return NV_OK;
-+    }
-+
-+    if (pmaIsPmaManaged(pPma, pmaRegion.base, pmaRegion.limit))
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: already managed base=0x%llx limit=0x%llx\n",
-+                  pmaRegion.base, pmaRegion.limit);
-+        return NV_OK;
-+    }
-+
-+    NV_PRINTF(LEVEL_ERROR,
-+              "SEC2_DEBUG_LATE_PMA: registering candidate=%u base=0x%llx limit=0x%llx "
-+              "cand_base=0x%llx cand_limit=0x%llx pma_region_id=%u\n",
-+              candidateIdx, pmaRegion.base, pmaRegion.limit,
-+              pCandidate->base, pCandidate->limit, numPmaRegions);
-+
-+    if (pCandidate->base < stockFbBytes &&
-+        pMemoryManager->Ram.numFBRegions >= MAX_FB_REGIONS)
-+    {
-+        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG_LATE_PMA: no FB region slot for split, "
-+                  "numRegions=%u max=%u\n",
-+                  pMemoryManager->Ram.numFBRegions, MAX_FB_REGIONS);
-+        return NV_ERR_INSUFFICIENT_RESOURCES;
-+    }
-+
-+    status = pmaRegisterRegion(pPma, numPmaRegions, NV_FALSE, &pmaRegion, 0, NULL);
-+
-+    if (status == NV_OK)
-+    {
-+        if (pCandidate->base < stockFbBytes)
-+        {
-+            FB_REGION_DESCRIPTOR publicRegion = *pCandidate;
-+            publicRegion.base = stockFbBytes;
-+            publicRegion.limit = pCandidate->limit;
-+            publicRegion.rsvdSize = 0;
-+            publicRegion.bRsvdRegion = NV_FALSE;
-+            publicRegion.bInternalHeap = NV_FALSE;
-+            publicRegion.bSupportCompressed = NV_FALSE;
-+
-+            pCandidate->limit = stockFbBytes - 1;
-+            pCandidate->rsvdSize = NV_MIN(pCandidate->rsvdSize,
-+                                          pCandidate->limit - pCandidate->base + 1);
-+
-+            pMemoryManager->Ram.fbRegion[pMemoryManager->Ram.numFBRegions] = publicRegion;
-+            pMemoryManager->Ram.numFBRegions++;
-+        }
-+        else
-+        {
-+            pCandidate->bRsvdRegion = NV_FALSE;
-+            pCandidate->rsvdSize = 0;
-+            pCandidate->bInternalHeap = NV_FALSE;
-+            pCandidate->bSupportCompressed = NV_FALSE;
-+        }
-+        memmgrRegenerateFbRegionPriority(pGpu, pMemoryManager);
-+    }
-+
-+    pmaGetFreeMemory(pPma, &pmaFreeAfter);
-+    pmaGetTotalMemory(pPma, &pmaTotalAfter);
-+
-+    NV_PRINTF(LEVEL_ERROR,
-+              "SEC2_DEBUG_LATE_PMA: status=0x%x pma_total 0x%llx->0x%llx "
-+              "pma_free 0x%llx->0x%llx\n",
-+              status, pmaTotalBefore, pmaTotalAfter, pmaFreeBefore, pmaFreeAfter);
-+
-+    return status;
-+}
-+
- 
- /*!
-  * @brief Retrieve the size of the client FB address space
-@@ -4138,7 +4342,9 @@
+@@ -4138,7 +4483,9 @@
  
      if (!bFifoLite && !RMCFG_FEATURE_PLATFORM_GSP && bVirtualMode &&
          IS_SILICON(pGpu) && !pMemorySystemConfig->bDisableCompbitBacking &&
@@ -261,3 +387,119 @@ diff -Naur a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c b/src/nvidia/src/kernel
      {
          // Turn on virtual mode to enable compressed allocation access
          ceUtilsParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _VIRTUAL_MODE, _TRUE);
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
+@@ -924,6 +924,45 @@
+     return NV_OK;
+ }
+ 
++static NV_STATUS
++_memmgrCmpValidateReservedRegionInsertion
++(
++    NvU32 devId,
++    NvU32 numFbRegions,
++    NvU32 maxFbRegions,
++    NvU64 hostBase,
++    NvU64 hostLimit,
++    NvU64 insertBase,
++    NvU64 insertSize,
++    NvU64 usableBytes,
++    NvU32 containingParents
++)
++{
++    NvU64 insertLimit;
++    NvU32 requiredSlots;
++
++    if (devId != 0x20C2 && devId != 0x2082)
++        return NV_OK;
++
++    if (numFbRegions == 0 || numFbRegions > maxFbRegions ||
++        insertSize == 0 || insertSize > usableBytes ||
++        containingParents != 1 ||
++        hostBase > hostLimit || insertBase < hostBase ||
++        insertBase > hostLimit ||
++        insertSize - 1 > hostLimit - insertBase)
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    insertLimit = insertBase + insertSize - 1;
++    requiredSlots = (insertBase > hostBase ? 1U : 0U) +
++                    (insertLimit < hostLimit ? 1U : 0U);
++    if (requiredSlots > maxFbRegions - numFbRegions)
++        return NV_ERR_INVALID_STATE;
++
++    return NV_OK;
++}
++
+ /*!
+  * @brief - This routine initializes the reserved video memory
+  * regions specific to GPUs using this HAL entry point; size
+@@ -1076,6 +1115,67 @@
+         pMemoryManager->rsvdMemorySize = RM_PAGE_ALIGN_UP(pMemoryManager->rsvdMemorySize);
+     }
+ 
++    if (bRsvdRegionIsValid && pMemoryManager->rsvdMemorySize)
++    {
++        NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;
++        if ((cmpDevId == 0x20C2 || cmpDevId == 0x2082) &&
++            (pMemoryManager->Ram.numFBRegions == 0 ||
++             pMemoryManager->Ram.numFBRegions > MAX_FB_REGIONS ||
++             rsvdRegion >= pMemoryManager->Ram.numFBRegions))
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG_PMA_GUARD: invalid pre-insertion "
++                      "region count=%u selected=%u max=%u; refusing "
++                      "reserved-memory init\n",
++                      pMemoryManager->Ram.numFBRegions,
++                      rsvdRegion, MAX_FB_REGIONS);
++            return NV_ERR_INVALID_STATE;
++        }
++
++        FB_REGION_DESCRIPTOR *pHostRegion =
++            &pMemoryManager->Ram.fbRegion[rsvdRegion];
++        NvU32 containingParents = 0;
++
++        for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
++        {
++            FB_REGION_DESCRIPTOR *pCandidate =
++                &pMemoryManager->Ram.fbRegion[i];
++            if (pMemoryManager->rsvdMemoryBase >= pCandidate->base &&
++                pMemoryManager->rsvdMemoryBase <= pCandidate->limit &&
++                pMemoryManager->rsvdMemorySize - 1 <=
++                    pCandidate->limit - pMemoryManager->rsvdMemoryBase)
++            {
++                containingParents++;
++            }
++        }
++
++        NV_STATUS cmpStatus = _memmgrCmpValidateReservedRegionInsertion(
++            cmpDevId,
++            pMemoryManager->Ram.numFBRegions,
++            MAX_FB_REGIONS,
++            pHostRegion->base,
++            pHostRegion->limit,
++            pMemoryManager->rsvdMemoryBase,
++            pMemoryManager->rsvdMemorySize,
++            pMemoryManager->Ram.fbUsableMemSize,
++            containingParents);
++
++        if (cmpStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG_PMA_GUARD: invalid reserved-region "
++                      "insertion host=[0x%llx,0x%llx] "
++                      "insert=[0x%llx,+0x%llx) count=%u max=%u parents=%u; "
++                      "refusing reserved-memory init\n",
++                      pHostRegion->base, pHostRegion->limit,
++                      pMemoryManager->rsvdMemoryBase,
++                      pMemoryManager->rsvdMemorySize,
++                      pMemoryManager->Ram.numFBRegions,
++                      MAX_FB_REGIONS, containingParents);
++            return cmpStatus;
++        }
++    }
++
+     if (!pGpu->getProperty(pGpu, PDB_PROP_GPU_BROKEN_FB))
+     {
+         NV_ASSERT(pMemoryManager->Ram.fbUsableMemSize >= pMemoryManager->rsvdMemorySize);
