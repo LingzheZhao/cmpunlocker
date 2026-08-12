@@ -93,7 +93,6 @@ GPU_BDFS=()
 GPU_DEVIDS=()
 GPU_PROFILES=()
 GPU_EXPECTED=()
-GPU_CURRENT=()
 COUNT_8GB=0
 COUNT_10GB=0
 COUNT_UNSUPPORTED=0
@@ -123,7 +122,6 @@ for PCI_LINE in "${PCI_LINES[@]}"; do
     GPU_DEVIDS+=("${DEVID}")
     GPU_PROFILES+=("${PROF}")
     GPU_EXPECTED+=("${EXP}")
-    GPU_CURRENT+=("${CUR_MEM}")
 
     if [[ "${PROF}" == "8gb" ]]; then
         COUNT_8GB=$((COUNT_8GB + 1))
@@ -146,11 +144,8 @@ if [[ "${TEN_GB_TARGET}" == "80gb" ]]; then
     (( COUNT_10GB == 1 && ${#GPU_BDFS[@]} == 1 )) || \
         die "Experimental 80GB mode currently supports one isolated 10de:2082 card and no other unlockable GPU"
     for i in "${!GPU_BDFS[@]}"; do
-        [[ "${GPU_PROFILES[$i]}" == "10gb" ]] || continue
-        [[ "${GPU_CURRENT[$i]}" =~ ^[0-9]+$ ]] || \
-            die "Cannot prove stock memory state for ${GPU_BDFS[$i]}; refusing experimental 80GB"
-        (( GPU_CURRENT[$i] >= 9728 && GPU_CURRENT[$i] <= 10752 )) || \
-            die "${GPU_BDFS[$i]} reports ${GPU_CURRENT[$i]} MiB, not stock 10GB; restore stock and cold-power-cycle before selecting 80GB"
+        [[ "${GPU_DEVIDS[$i]}" == "2082" ]] || continue
+        info "${GPU_BDFS[$i]} is eligible for the 10GB→80GB profile by PCI ID 10de:2082; current driver-reported VRAM does not determine the physical variant"
         revision="$(cat "/sys/bus/pci/devices/${GPU_BDFS[$i]}/revision" 2>/dev/null || true)"
         [[ "${revision,,}" == "0xa1" ]] || \
             die "${GPU_BDFS[$i]} revision ${revision:-unknown} is outside the experimental 80GB whitelist (requires a1)"

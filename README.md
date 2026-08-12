@@ -56,8 +56,9 @@ experimental target:
 sudo ./install.sh --experimental-80g
 ```
 
-This mode currently requires one isolated stock-10G `10de:2082` card (no other
-unlockable GPU), subsystem `10de:1557`, revision `a1`, VBIOS `92.00.66.00.02`,
+This mode currently requires one isolated `10de:2082` 10GB hardware variant
+(identified by PCI ID, not the currently loaded driver's `memory.total`), with
+no other unlockable GPU, subsystem `10de:1557`, revision `a1`, VBIOS `92.00.66.00.02`,
 nvidia-open 610.43.02, and the pinned stock GSP firmware. It has source,
 boundary, and module-build coverage, but no completed 80G hardware stability run. See
 [the cmp-easyunlock analysis](docs/EASYUNLOCK-80G.md).
