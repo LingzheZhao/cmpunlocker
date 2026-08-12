@@ -333,7 +333,7 @@
 +                          "SEC2_DEBUG_PMA_GUARD: fbSize=0x%llx "
 +                          "protectedStart=0x%llx publicBytes=0x%llx "
 +                          "pmaBytes=0x%llx "
-+                          "status=safe build=cmpunlocker-safety-v4\n",
++                          "status=safe build=cmpunlocker-safety-v5-2082-40g\n",
 +                          validatedFbSize, validatedProtectedStart,
 +                          validatedPublicBytes, pmaBytes);
 +            }

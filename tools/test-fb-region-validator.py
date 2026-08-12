@@ -23,6 +23,8 @@ import tempfile
 PURE_VALIDATOR = "_kgspSec2PostblTimingValidateFbRegionTable"
 LAYOUT_VALIDATOR = "_kgspSec2PostblTimingValidateFbLayout"
 ENABLE_GATE = "_kgspSec2PostblTimingEnabled"
+TEN_GB_FB_40 = "0x0000000A00000000ULL"
+TEN_GB_FB_80 = "0x0000001400000000ULL"
 
 
 def die(message: str) -> "NoReturn":
@@ -162,7 +164,13 @@ def extract_function(text: str, name: str, return_type: str = "NV_STATUS") -> st
     return text[start : closing + 1]
 
 
-def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None:
+def validate_source_shape(
+    text: str,
+    gate: str,
+    pure: str,
+    wrapper: str,
+    expected_fingerprint: str,
+) -> None:
     source_code = mask_c_comments_and_literals(text)
     required_source_markers = (
         "SEC2_DEBUG_FB_LAYOUT: validated",
@@ -182,6 +190,11 @@ def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None
             "SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID",
             r"0x2082(?:U)?",
             "0x2082",
+        ),
+        (
+            "SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_SUBDEVICE_ID",
+            r"0x155710DE(?:U)?",
+            "0x155710DE",
         ),
         (
             "SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT",
@@ -245,7 +258,7 @@ def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None
             line_end = len(text)
         fingerprint_is_exact = re.fullmatch(
             rf"[ \t]*#[ \t]*define[ \t]+{fingerprint}[ \t]+"
-            r'"cmpunlocker-safety-v4"[ \t]*',
+            rf'"{re.escape(expected_fingerprint)}"[ \t]*',
             text[line_start:line_end],
         ) is not None
     if (
@@ -254,7 +267,7 @@ def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None
     ):
         die(
             f'{fingerprint} must have one active definition equal to '
-            '"cmpunlocker-safety-v4"'
+            f'"{expected_fingerprint}"'
         )
 
     gate_code = mask_c_comments_and_literals(gate)
@@ -262,9 +275,13 @@ def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None
         rf"\s*static\s+NvBool\s+{re.escape(ENABLE_GATE)}\s*"
         r"\(\s*OBJGPU\s*\*\s*pGpu\s*\)\s*\{\s*"
         r"NvU32\s+devId\s*=\s*pGpu\s*->\s*idInfo\.PCIDeviceID\s*"
-        r">>\s*16\s*;\s*return\s*\(\s*devId\s*==\s*"
+        r">>\s*16\s*;\s*NvU32\s+subDeviceId\s*=\s*"
+        r"pGpu\s*->\s*idInfo\.PCISubDeviceID\s*;\s*"
+        r"return\s*\(\s*devId\s*==\s*"
         r"SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID\s*\|\|\s*"
-        r"devId\s*==\s*SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID\s*"
+        r"\(\s*devId\s*==\s*SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID\s*"
+        r"&&\s*subDeviceId\s*==\s*"
+        r"SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_SUBDEVICE_ID\s*\)\s*"
         r"\)\s*;\s*\}\s*",
         re.DOTALL,
     )
@@ -375,6 +392,49 @@ def validate_source_shape(text: str, gate: str, pure: str, wrapper: str) -> None
             die(f"forbidden native-table repair remains: {marker}")
 
 
+def detect_ten_gb_target(wrapper: str, text: str) -> str:
+    match = re.search(
+        r"NvU64 expectedFbSize\s*=\s*"
+        r"\(devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID\)\s*"
+        r"\?\s*0x0000001000000000ULL\s*:\s*"
+        r"(0x(?:0000000A00000000|0000001400000000)ULL)\s*;",
+        wrapper,
+        re.DOTALL,
+    )
+    if match is None:
+        die("10 GB target framebuffer expression is missing or unsupported")
+
+    target = match.group(1)
+    if target == TEN_GB_FB_40:
+        cfg1 = "0x02669000U"
+        lmr = "0x0000028AU"
+    elif target == TEN_GB_FB_80:
+        cfg1 = "0x02779000U"
+        lmr = "0x0000028BU"
+    else:  # pragma: no cover - constrained by the expression above
+        die(f"unsupported 10 GB target {target}")
+
+    pair = re.compile(
+        r"else\s*\{\s*cfg1Value\s*=\s*"
+        + re.escape(cfg1)
+        + r"\s*;\s*lmrValue\s*=\s*"
+        + re.escape(lmr)
+        + r"\s*;\s*\}",
+        re.DOTALL,
+    )
+    if pair.search(mask_c_comments_and_literals(text)) is None:
+        die(f"10 GB target {target} is inconsistent with its CFG1/LMR pair")
+    return target
+
+
+def fingerprint_for_target(target: str) -> str:
+    if target == TEN_GB_FB_40:
+        return "cmpunlocker-safety-v5-2082-40g"
+    if target == TEN_GB_FB_80:
+        return "cmpunlocker-safety-v5-2082-80g-experimental"
+    die(f"unsupported 10 GB target {target}")
+
+
 HARNESS_PREFIX = r'''
 #include <stdarg.h>
 #include <stddef.h>
@@ -467,6 +527,7 @@ typedef struct MEMORY_DESCRIPTOR {
 typedef struct OBJGPU {
     struct {
         NvU32 PCIDeviceID;
+        NvU32 PCISubDeviceID;
     } idInfo;
     NvBool bVirtual;
 } OBJGPU;
@@ -481,12 +542,13 @@ typedef struct KernelGsp {
 
 #define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID 0x20C2U
 #define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID 0x2082U
+#define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_SUBDEVICE_ID 0x155710DEU
 #define SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT 0x00010000ULL
 #define SEC2_POSTBL_TIMING_STOCK_8GB_FB_BYTES 0x0000000200000000ULL
 #define SEC2_POSTBL_TIMING_STOCK_10GB_FB_BYTES 0x0000000280000000ULL
 #define SEC2_POSTBL_TIMING_MAX_NATIVE_NONPUBLIC_BYTES 0x0000000080000000ULL
 #define SEC2_POSTBL_TIMING_FB_REGION_SETUP_HEADROOM 6U
-#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT "cmpunlocker-safety-v4"
+#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT TEST_BUILD_FINGERPRINT
 #define GSP_FW_WPR_META_MAGIC 0xdc3aae21371a60b3ULL
 #define GSP_FW_WPR_META_REVISION 1ULL
 
@@ -514,13 +576,19 @@ HARNESS_SUFFIX = r'''
 #define ALIGNMENT 0x00010000ULL
 #define FB_64G 0x0000001000000000ULL
 #define FB_40G 0x0000000A00000000ULL
+#define FB_80G 0x0000001400000000ULL
 #define STOCK_8G 0x0000000200000000ULL
 #define STOCK_10G 0x0000000280000000ULL
 #define RSVD_64G 0x0000000FF7200000ULL
 #define RSVD_40G 0x00000009F7200000ULL
+#define RSVD_80G 0x00000013F7200000ULL
 #define PROTECTED_BYTES 0x0000000008E00000ULL
 #define MIN_PUBLIC_64G 0x0000000F80000000ULL
 #define MIN_PUBLIC_40G 0x0000000980000000ULL
+#define MIN_PUBLIC_80G 0x0000001380000000ULL
+#define TARGET_10G_FB TEST_10GB_TARGET_FB
+#define TARGET_10G_RSVD (TARGET_10G_FB - PROTECTED_BYTES)
+#define TARGET_10G_MIN_PUBLIC (TARGET_10G_FB - 0x0000000080000000ULL)
 #define LOW_RESERVED_END 0x0000000010080000ULL
 #define SENTINEL_PUBLIC 0xA55AA55AA55AA55AULL
 #define SENTINEL_RESERVED 0x5AA55AA55AA55AA5ULL
@@ -534,12 +602,17 @@ typedef struct TestContext {
 
 static unsigned int failures;
 
-static void expectGate(const char *name, NvU32 devId, NvBool expected)
+static void expectGate(
+    const char *name,
+    NvU32 devId,
+    NvU32 subDeviceId,
+    NvBool expected)
 {
     OBJGPU gpu = {0};
     NvBool actual;
 
     gpu.idInfo.PCIDeviceID = devId << 16;
+    gpu.idInfo.PCISubDeviceID = subDeviceId;
     actual = _kgspSec2PostblTimingEnabled(&gpu);
     if (actual != expected)
     {
@@ -647,6 +720,7 @@ static TestContext validContext(NvU32 devId, NvU64 fbSize, NvU64 protectedStart)
     TestContext context = {0};
 
     context.gpu.idInfo.PCIDeviceID = devId << 16;
+    context.gpu.idInfo.PCISubDeviceID = 0x155710DEU;
     context.meta.magic = GSP_FW_WPR_META_MAGIC;
     context.meta.revision = GSP_FW_WPR_META_REVISION;
     context.meta.fbSize = fbSize;
@@ -718,9 +792,10 @@ int main(void)
     TestContext context;
     NvU64 i;
 
-    expectGate("20c2-enabled", 0x20C2U, NV_TRUE);
-    expectGate("2082-enabled", 0x2082U, NV_TRUE);
-    expectGate("other-device-disabled", 0x1234U, NV_FALSE);
+    expectGate("20c2-enabled", 0x20C2U, 0U, NV_TRUE);
+    expectGate("2082-enabled", 0x2082U, 0x155710DEU, NV_TRUE);
+    expectGate("2082-wrong-subdevice", 0x2082U, 0x155810DEU, NV_FALSE);
+    expectGate("other-device-disabled", 0x1234U, 0U, NV_FALSE);
 
     params = nativeTable(FB_64G, RSVD_64G);
     expectTable("20c2-native-crosses-8GiB", &params, FB_64G, FB_64G,
@@ -731,6 +806,11 @@ int main(void)
     expectTable("2082-native-40GiB", &params, FB_40G, FB_40G,
                 RSVD_40G, MIN_PUBLIC_40G, NV_TRUE,
                 0x00000009E7180000ULL, 0x0000000018E80000ULL);
+
+    params = nativeTable(FB_80G, RSVD_80G);
+    expectTable("2082-native-80GiB", &params, FB_80G, FB_80G,
+                RSVD_80G, MIN_PUBLIC_80G, NV_TRUE,
+                0x00000013E7180000ULL, 0x0000000018E80000ULL);
 
     memset(&params, 0, sizeof(params));
     addRegion(&params, 0, STOCK_8G, 0, NV_FALSE);
@@ -904,8 +984,18 @@ int main(void)
     context = validContext(0x20C2U, FB_64G, RSVD_64G);
     expectLayout("20c2-wrapper-native", &context, NV_TRUE);
 
-    context = validContext(0x2082U, FB_40G, RSVD_40G);
-    expectLayout("2082-wrapper-native", &context, NV_TRUE);
+    context = validContext(0x2082U, TARGET_10G_FB, TARGET_10G_RSVD);
+    expectLayout("2082-wrapper-configured-target", &context, NV_TRUE);
+
+    context = validContext(0x2082U, TARGET_10G_FB, TARGET_10G_RSVD);
+    context.gpu.idInfo.PCISubDeviceID = 0x155810DEU;
+    expectLayout("2082-wrapper-wrong-subdevice", &context, NV_FALSE);
+
+    context = validContext(
+        0x2082U,
+        TARGET_10G_FB == FB_40G ? FB_80G : FB_40G,
+        TARGET_10G_FB == FB_40G ? RSVD_80G : RSVD_40G);
+    expectLayout("2082-wrapper-rejects-other-target", &context, NV_FALSE);
 
     context = validContext(0x20C3U, FB_64G, RSVD_64G);
     expectLayout("unsupported-device", &context, NV_FALSE);
@@ -1023,10 +1113,14 @@ def run_tests(source: Path) -> None:
     gate = extract_function(text, ENABLE_GATE, "NvBool")
     pure = extract_function(text, PURE_VALIDATOR)
     wrapper = extract_function(text, LAYOUT_VALIDATOR)
-    validate_source_shape(text, gate, pure, wrapper)
+    ten_gb_target = detect_ten_gb_target(wrapper, text)
+    fingerprint = fingerprint_for_target(ten_gb_target)
+    validate_source_shape(text, gate, pure, wrapper, fingerprint)
 
     harness = (
         HARNESS_PREFIX
+        + f"\n#define TEST_10GB_TARGET_FB {ten_gb_target}\n"
+        + f'#define TEST_BUILD_FINGERPRINT "{fingerprint}"\n'
         + "\n"
         + gate
         + "\n\n"

@@ -11,7 +11,7 @@
  
  #include <sound/core.h>             /* HDA struct snd_card */
  
-@@ -1360,6 +1364,87 @@
+@@ -1360,6 +1364,94 @@
  #if defined(NV_UVM_ENABLE)
      nv_uvm_resume_P2P(pUuid);
  #endif
@@ -39,7 +39,14 @@
 +                      "CMP Gen2: no upstream PCIe bridge; skipping link retrain\n");
 +        return;
 +    }
-+    bar0 = ioremap(pci_resource_start(gpu, 0), 0x90000);
++    if (!(pci_resource_flags(gpu, 0) & IORESOURCE_MEM) ||
++        pci_resource_len(gpu, 0) < 0x90000)
++    {
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP Gen2: BAR0 resource is missing or too small; skipping link retrain\n");
++        return;
++    }
++    bar0 = pci_iomap_range(gpu, 0, 0, 0x90000);
 +    if (bar0 == NULL)
 +    {
 +        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
@@ -52,7 +59,7 @@
 +    writel((link_config & ~0x000c0000U) | (2U << 18), bar0 + 0x8c040);
 +    writel(0x00000006U, bar0 + 0x8872c);
 +    (void)readl(bar0 + 0x8872c);
-+    iounmap(bar0);
++    pci_iounmap(gpu, bar0);
 +    msleep(50);
 +    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
 +    if (ret)
@@ -99,7 +106,7 @@
  }
  
  /*
-@@ -1530,6 +1624,8 @@
+@@ -1530,6 +1631,8 @@
          nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
      }
  

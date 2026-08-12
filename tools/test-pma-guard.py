@@ -240,7 +240,11 @@ def extract_guard_segment(function: str) -> str:
 
 
 def validate_source_shape(
-    function: str, segment: str, preheap_helper: str, reserved_text: str
+    function: str,
+    segment: str,
+    preheap_helper: str,
+    reserved_text: str,
+    expected_fingerprint: str,
 ) -> None:
     """Require the invariants and their ordering before compiling the segment."""
 
@@ -291,7 +295,7 @@ def validate_source_shape(
     equality = segment.find("if (pmaBytes != validatedPublicBytes)", total_query)
     refusal = segment.find("return NV_ERR_INVALID_STATE;", equality)
     safe_log = segment.find(
-        '"status=safe build=cmpunlocker-safety-v4\\n"', equality
+        f'"status=safe build={expected_fingerprint}\\n"', equality
     )
     if not (
         0
@@ -489,6 +493,27 @@ def validate_source_shape(
             "reserved-region helper failure block must return cmpStatus "
             "before accounting mutation and insertion"
         )
+
+
+def detect_ten_gb_target(segment: str) -> str:
+    match = re.search(
+        r"NvU64 targetFbBytes\s*=\s*\(devId == 0x20C2\)\s*\?\s*"
+        r"0x0000001000000000ULL\s*:\s*"
+        r"(0x(?:0000000A00000000|0000001400000000)ULL)\s*;",
+        segment,
+        re.DOTALL,
+    )
+    if match is None:
+        die("cannot determine configured 10GB-card PMA target geometry")
+    return match.group(1)
+
+
+def fingerprint_for_target(target: str) -> str:
+    if target == "0x0000000A00000000ULL":
+        return "cmpunlocker-safety-v5-2082-40g"
+    if target == "0x0000001400000000ULL":
+        return "cmpunlocker-safety-v5-2082-80g-experimental"
+    die(f"unsupported 10GB-card PMA target {target}")
 
 
 CAPACITY_HARNESS_PREFIX = r'''
@@ -806,6 +831,8 @@ HARNESS_SUFFIX = r'''
 
 #define FB64 0x0000001000000000ULL
 #define FB40 0x0000000a00000000ULL
+#define FB80 0x0000001400000000ULL
+#define FB10_TARGET TEST_10GB_TARGET_FB
 #define LIVE_PROTECTED 0x0000000ff7200000ULL
 #define LIVE_PUBLIC 0x0000000fd8e50000ULL
 
@@ -913,18 +940,23 @@ static void initLive20c2(TestContext *pContext)
     resetStubs(LIVE_PUBLIC);
 }
 
-static void initSynthetic2082(TestContext *pContext)
+static void initSynthetic2082WithSize(TestContext *pContext, NvU64 fbSize)
 {
-    const NvU64 protectedStart = FB40 - 0x08e00000ULL;
+    const NvU64 protectedStart = fbSize - 0x08e00000ULL;
     const NvU64 publicBase = 0x10080000ULL;
-    initCommon(pContext, 0x2082U, FB40, protectedStart);
+    initCommon(pContext, 0x2082U, fbSize, protectedStart);
     addRegion(pContext, 0, publicBase - 1ULL,
               NV_TRUE, NV_FALSE, NV_FALSE, publicBase);
     addRegion(pContext, publicBase, protectedStart - 1ULL,
               NV_FALSE, NV_FALSE, NV_FALSE, 0);
-    addRegion(pContext, protectedStart, FB40 - 1ULL,
-              NV_TRUE, NV_FALSE, NV_FALSE, FB40 - protectedStart);
+    addRegion(pContext, protectedStart, fbSize - 1ULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, fbSize - protectedStart);
     resetStubs(protectedStart - publicBase);
+}
+
+static void initSynthetic2082(TestContext *pContext)
+{
+    initSynthetic2082WithSize(pContext, FB10_TARGET);
 }
 
 static void expectResult(
@@ -988,6 +1020,9 @@ int main(void)
 
     initSynthetic2082(&context);
     expectPass("synthetic-2082-map", &context);
+
+    initSynthetic2082WithSize(&context, FB10_TARGET == FB40 ? FB80 : FB40);
+    expectEarlyRefusal("synthetic-2082-other-target-refused", &context);
 
     initLive20c2(&context);
     context.heap.base = 0x20000000ULL;
@@ -1125,7 +1160,7 @@ int main(void)
         return 1;
     }
 
-    puts("PMA-guard self-test: PASS (29 compiled vectors)");
+    puts("PMA-guard self-test: PASS (30 compiled vectors)");
     return 0;
 }
 '''
@@ -1199,7 +1234,11 @@ def run_tests(source: Path) -> None:
         reserved_helper = extract_function(reserved_text, RESERVED_INSERT_HELPER)
         if "#define CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM 6U" not in text:
             die("missing exact pre-heap headroom definition")
-        validate_source_shape(function, segment, preheap_helper, reserved_text)
+        ten_gb_target = detect_ten_gb_target(segment)
+        fingerprint = fingerprint_for_target(ten_gb_target)
+        validate_source_shape(
+            function, segment, preheap_helper, reserved_text, fingerprint
+        )
 
         with tempfile.TemporaryDirectory(prefix="cmpunlocker-pma-guard-test.") as temp:
             temp_dir = Path(temp)
@@ -1215,7 +1254,13 @@ def run_tests(source: Path) -> None:
             capacity_output = compile_and_run(
                 capacity_harness, "pma-capacity-test", temp_dir
             )
-            guard_harness = HARNESS_PREFIX + "\n" + segment + "\n" + HARNESS_SUFFIX
+            guard_harness = (
+                HARNESS_PREFIX
+                + f"\n#define TEST_10GB_TARGET_FB {ten_gb_target}\n"
+                + segment
+                + "\n"
+                + HARNESS_SUFFIX
+            )
             guard_output = compile_and_run(
                 guard_harness, "pma-guard-test", temp_dir
             )

@@ -1,20 +1,57 @@
-diff -Naur a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
---- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c	2026-07-18 11:26:26.890781209 -0700
-+++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c	2026-07-18 11:26:26.891976131 -0700
-@@ -220,6 +220,16 @@
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -191,6 +191,27 @@
+     return NV_OK;
+ }
+ 
++static NvU64
++_kbusCmpDefaultBar0Offset(OBJGPU *pGpu, MemoryManager *pMemoryManager)
++{
++    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU64 fbSizeMb = pMemoryManager->Ram.fbAddrSpaceSizeMb;
++    NvU64 nativeFbSizeMb = 0;
++
++    if (devId == 0x20C2)
++        nativeFbSizeMb = 0x2000ULL;
++    else if (devId == 0x2082)
++        nativeFbSizeMb = 0x2800ULL;
++
++    if (nativeFbSizeMb != 0 && fbSizeMb > nativeFbSizeMb)
++        fbSizeMb = nativeFbSizeMb;
++
++    if ((fbSizeMb << 20) < DRF_SIZE(NV_PRAMIN))
++        return 0;
++
++    return (fbSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
++}
++
+ /*!
+  * @brief program the default BAR0 window based on the mode we are running at.
+  */
+@@ -219,7 +240,7 @@
+     }
      else
      {
-         offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
-+
-+        {
-+            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-+            if ((devId == 0x20C2 || devId == 0x2082) &&
-+                pMemoryManager->Ram.fbAddrSpaceSizeMb > 0x2000)
-+            {
-+                NvU64 stockOffset = (0x2000ULL << 20) - DRF_SIZE(NV_PRAMIN);
-+                offsetBar0 = stockOffset;
-+            }
-+        }
+-        offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
++        offsetBar0 = _kbusCmpDefaultBar0Offset(pGpu, pMemoryManager);
      }
  
      //
+@@ -507,7 +528,7 @@
+                 // Bind the BAR0 window to its default location
+                 // note: we can't move the window for all intents and purposes since VBIOS
+                 //       will also use the window at arbitrary locations (eg during an SMI event
+-                NvU64 offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
++                NvU64 offsetBar0 = _kbusCmpDefaultBar0Offset(pGpu, pMemoryManager);
+                 kbusSetBAR0WindowVidOffset_HAL(pGpu, pKernelBus, offsetBar0);
+             }
+         }
+@@ -3929,7 +3950,7 @@
+     {
+         if (!KBUS_BAR0_PRAMIN_DISABLED(pGpu))
+         {
+-            offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
++            offsetBar0 = _kbusCmpDefaultBar0Offset(pGpu, pMemoryManager);
+             (void)kbusSetBAR0WindowVidOffset_HAL(pGpu, pKernelBus, offsetBar0);
+         }
+     }

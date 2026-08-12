@@ -1,0 +1,3 @@
+[submodule "cmp-easyunlock"]
+	path = cmp-easyunlock
+	url = https://github.com/zerobitcopy/cmp-easyunlock

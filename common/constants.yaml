@@ -3,6 +3,13 @@ driver_versions:
   - "610.43.03"
   - "610.43.02"
 
+experimental_80g_gate:
+  driver_version: "610.43.02"
+  subsystem: "10de:1557"
+  revision: "a1"
+  vbios: "92.00.66.00.02"
+  firmware_sha256: "c8fc1a92c90b034bbbe4d56ca94b0dc95afb52d3409a7880186ae03c7dde17f3"
+
 gpu:
   vendor_id: "10de"
   device_ids:
@@ -40,3 +47,12 @@ profiles:
     cfg1: "0x02669000"
     lmr: "0x0000028A"
     fb_bytes: "0x0000000A00000000"
+    build_fingerprint: "cmpunlocker-safety-v5-2082-40g"
+  "10gb_80_experimental":
+    stock_mib: 10240
+    unlocked_mib: 81920
+    cfg1: "0x02779000"
+    lmr: "0x0000028B"
+    fb_bytes: "0x0000001400000000"
+    build_fingerprint: "cmpunlocker-safety-v5-2082-80g-experimental"
+    experimental: true

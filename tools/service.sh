@@ -3,12 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SERVICE_NAME="gen2.service"
+SERVICE_NAME="cmpunlocker-gen2.service"
 SERVICE_SOURCE="${PROJECT_DIR}/systemd/${SERVICE_NAME}"
 SERVICE_TARGET="/etc/systemd/system/${SERVICE_NAME}"
 HAMMER_SOURCE="${SCRIPT_DIR}/hammer.sh"
-HAMMER_TARGET="/usr/local/sbin/gen2-hammer"
-LOG_FILE="/var/log/gen2.log"
+HAMMER_TARGET="/usr/local/sbin/cmpunlocker-gen2-hammer"
+LOG_FILE="/var/log/cmpunlocker-gen2.log"
 
 source "${PROJECT_DIR}/common/lib.sh"
 

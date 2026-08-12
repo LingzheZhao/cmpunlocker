@@ -41,13 +41,26 @@ To install cmpunlocker, run the following command:
 sudo ./install.sh
 ```
 
-The profile option is retained for installation metadata and backward
-compatibility. It does not override the PCI device ID selected geometry:
+The profile option is retained for backward compatibility and must agree with
+the detected PCI device ID:
 
 ```bash
 sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
+
+The researched 10GB → 80GB geometry is available only as an explicit
+experimental target:
+
+```bash
+sudo ./install.sh --experimental-80g
+```
+
+This mode currently requires one isolated stock-10G `10de:2082` card (no other
+unlockable GPU), subsystem `10de:1557`, revision `a1`, VBIOS `92.00.66.00.02`,
+nvidia-open 610.43.02, and the pinned stock GSP firmware. It has source,
+boundary, and module-build coverage, but no completed 80G hardware stability run. See
+[the cmp-easyunlock analysis](docs/EASYUNLOCK-80G.md).
 
 The driver changes both memory geometry and firmware-protected memory ranges.
 Do not hot-reload the NVIDIA modules or rely on a warm reboot. Shut the machine
@@ -57,31 +70,37 @@ and then power it on again.
 ## Memory Safety
 
 Memory geometry is selected from the PCI device ID at runtime: `10de:20c2`
-uses the 64 GiB geometry and `10de:2082` uses the 40 GiB geometry. Reported
+uses the 64 GiB geometry and `10de:2082` uses 40 GiB by default or the explicit
+experimental 80 GiB target. Reported
 capacity alone is not proof that the protected firmware range is excluded from
 the public allocator. Before running a workload, the current boot log must
 contain both of these successful checks:
 
 ```text
-SEC2_DEBUG_FB_LAYOUT: ... status=safe ... build=cmpunlocker-safety-v4
-SEC2_DEBUG_PMA_GUARD: ... status=safe ... build=cmpunlocker-safety-v4
+SEC2_DEBUG_FB_LAYOUT: ... status=safe ... build=cmpunlocker-safety-v5-2082-40g
+SEC2_DEBUG_PMA_GUARD: ... status=safe ... build=cmpunlocker-safety-v5-2082-40g
 ```
+
+An 80G build must instead show
+`cmpunlocker-safety-v5-2082-80g-experimental` in both proofs. `verify.sh`
+requires the exact target-specific marker, checks the current PCI inventory,
+and verifies the checksummed module overlay selected by `modinfo`.
 
 Any rejected layout, allocator mismatch, or missing check is a stop condition.
 The preceding `cmpunlocker-safety-v3` build completed a post-reboot hardware
 test on a `10de:20c2` card with driver 610.57.04, including a 56 GiB
-bidirectional copy and full readback. This `cmpunlocker-safety-v4` revision adds
-fail-closed region-capacity and insertion checks; it has passed source,
-boundary, and full-module-build validation but still requires installation and
-a new hardware test. The `10de:2082` 40 GiB path has source and boundary-test
-coverage but has not completed the same hardware test.
+bidirectional copy and full readback. The current v5 revision adds
+target-bound fingerprints, transactional module installation, stricter
+device/firmware gates, and consistent PRAMIN handling. A `10de:2082` card has
+completed a 40 GiB boot with both safe proofs and PCIe Gen2; the 80 GiB target
+remains experimental and must not be treated as production-stable.
 
 ## What Gets Unlocked
 
 | Feature | Status |
 |---|---|
 | Full SM compute throughput (SS0/SS1) | Working ✓ |
-| Memory geometry | 64 GiB (`10de:20c2`): v3 hardware-tested, v4 source/build-tested; 40 GiB (`10de:2082`): source-tested |
+| Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`, default); 80 GiB (`10de:2082`, experimental and hardware-unvalidated) |
 | PCIe Gen 2 speeds | Working ✓ |
 | JTAG (Host2Jtag register access) | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |

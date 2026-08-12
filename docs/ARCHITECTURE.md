@@ -13,7 +13,9 @@ The CMP 170HX is physically a complete GA100 die (same silicon as the A100) but 
 The CMP 170HX ships with:
 
 - **Disabled SMs (Streaming Multiprocessors)**: SS0 and SS1 (Suspension State registers) artificially disable clusters of SMs
-- **Restricted memory geometry**: The HBM2e controller is configured for 8GB or 10GB instead of the full 64GB or 40GB the die supports
+- **Restricted memory geometry**: The HBM2e controller is configured for 8GB
+  or 10GB; the supported unlock targets are 64GB/40GB, plus a researched but
+  hardware-unvalidated 80GB target for the 10GB card
 - **PCIe Gen 1 cap**: The link is trained down to Gen 1 speeds instead of the Gen 2 the die supports
 - **JTAG lockout**: Host2Jtag register access is locked behind PLM permissions
 - **Firmware locks**: OTP (One-Time Programmable) fuses prevent reconfiguration at runtime
@@ -30,7 +32,8 @@ Instead of modifying OTP (which is physically locked), cmpunlocker intercepts th
 2. **Configure memory geometry** — write CFG1 (config) and LMR (LM Request) registers to unlock full HBM2e capacity
 3. **Enable all SMs** — write SS0 and SS1 (Suspension State) to re-enable disabled SM clusters
 4. **Retrain the PCIe link** — request and retrain to Gen 2 now that the XP3G PLMs are open
-5. **Finalize** — perform late PMA (Power Management Array) adjustments and allow normal boot to continue
+5. **Validate and finalize** — restore the stock signature, let the GSP build its
+   native FB map, and fail closed unless the WPR/FB/PMA boundaries match
 
 ---
 
@@ -62,12 +65,17 @@ The GPU memory controller is configured by two registers:
 | Card | CFG1 | LMR | Unlocked Capacity |
 |---|---|---|---|
 | 8GB | `0x02779000` | `0x0000020B` | 64GB |
-| 10GB | `0x02669000` | `0x0000028A` | 40GB |
+| 10GB (default) | `0x02669000` | `0x0000028A` | 40GB |
+| 10GB (experimental) | `0x02779000` | `0x0000028B` | 80GB |
 
 - **CFG1**: Memory configuration register (address mapping, bank layout)
 - **LMR**: LM (Local Memory) Request register (capacity/geometry selector)
 
-cmpunlocker writes both during the unlock sequence. Detection of 8GB vs 10GB happens at install time via Python script (reads `nvidia-smi` output).
+cmpunlocker writes both during the unlock sequence. The kernel selects the
+8GB/10GB hardware variant from the PCI ID. The build target selects whether a
+`10de:2082` uses 40G or the explicit experimental 80G geometry, and the same
+selection is compiled into SEC2 write, Booter readback, FB validation, PMA
+validation, and the build fingerprint.
 
 ---
 
@@ -76,7 +84,8 @@ cmpunlocker writes both during the unlock sequence. Detection of 8GB vs 10GB hap
 SS0 and SS1 are Suspension State registers that control which SM clusters are active:
 
 - Stock firmware sets these to disable ~50% of the SMs
-- cmpunlocker writes `0xffffffff` to both, enabling all clusters
+- cmpunlocker writes the reviewed values `SS0=0x88888888` and
+  `SS1=0x00000008`, then requires exact readback
 - The GPU can then use full compute throughput
 
 Expected dmesg output:
@@ -87,13 +96,13 @@ SEC2_DEBUG: SS1 = 0xffffffff
 
 ---
 
-### FB & PMA Adjustments
+### FB & Physical Memory Allocator validation
 
-After core reconfiguration, the frame buffer (FB) and power management array (PMA) are adjusted to support the new memory geometry and active SMs:
-
-- FB is resized to reflect the new memory capacity
-- PMA is reconfigured for the enabled SM clusters
-- These changes are performed in "late PMA" phase, near the end of boot
+After core reconfiguration, the GSP publishes its native framebuffer map. The
+driver does not extend or repair that map. It checks exact coverage, alignment,
+the protected top carveout, WPR metadata, and public byte count before heap/PMA
+registration. It then requires PMA's reported total to equal the validated
+public bytes. Any mismatch aborts initialization.
 
 ---
 
@@ -133,9 +142,11 @@ Host2Jtag register access is locked behind the same class of PLM permission as t
    - CFG1/LMR written (memory geometry)
    - SS0/SS1 written (compute state)
    - PCIe link retrained to Gen 2
-   - Late PMA adjustments applied
+   - Stock signature restored; native FB/WPR and PMA layouts validated
 4. **GSP boot completes** → GPU is now fully unlocked
-5. **Driver ready** → `nvidia-smi` shows 65536 MiB (8GB) or 40960 MiB (10GB) at PCIe Gen 2, with JTAG register access available
+5. **Driver ready** → `nvidia-smi` shows about 65536 MiB (8GB hardware),
+   40960 MiB (10GB default), or 81920 MiB (10GB experimental), with both safe
+   proof logs present
 
 ---
 
@@ -143,19 +154,25 @@ Host2Jtag register access is locked behind the same class of PLM permission as t
 
 The unlock is applied by **patched kernel modules**, not a userspace daemon:
 
-- Modified `nvidia-drm.ko` and `nvidia.ko` are installed to `/lib/modules/$(uname -r)/updates/cmpunlocker/`
-- These modules load before the stock NVIDIA modules (due to the `updates/` directory priority)
-- Every time the driver initializes (on boot or after a reload), the patched sequence runs
+- All five NVIDIA modules are checksummed and transactionally installed to
+  `/lib/modules/$(uname -r)/updates/cmpunlocker/`
+- A per-module depmod override makes that exact directory win over retained
+  stock/DKMS modules; `modinfo` verifies every resolved path
+- Every cold boot runs the patched sequence. Hot reload and warm reboot are
+  explicitly unsupported because memory/WPR geometry persists in GPU state
 - The unlock persists indefinitely until `./remove.sh` is run
 
-Card profile (8GB vs 10GB) is stored in `/lib/modules/$(uname -r)/updates/cmpunlocker/card_profile` at install time and used during every boot.
+The installed inventory, 2082 target, checksums, and target-specific build
+fingerprint are stored beside the modules and verified after boot.
 
 ---
 
 ## Known Limitations
 
 - **Secure Boot must be disabled** — patched modules are unsigned
-- **Requires nvidia-open 610.43.0x** — stock NVIDIA proprietary driver has different boot paths and cannot be patched the same way
+- **Requires a version listed in `driver/VERSION`** — the stock proprietary
+  driver has different boot paths and cannot be patched the same way
+- **80G is experimental** — source/build validation is complete, but sustained
+  hardware validation above 40 GiB is not
 - **Linux only** — GSP boot path is Linux-specific (Windows WDDM driver is fundamentally different)
 - **Kernel headers required** — modules must be compiled for the running kernel version
-

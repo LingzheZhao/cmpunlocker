@@ -1,0 +1,26 @@
+name: source-matrix
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Install host test dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc patch python3
+      - name: Validate repository scripts
+        run: |
+          bash -n install.sh remove.sh verify.sh driver/build.sh tools/hammer.sh tools/service.sh tools/test-source-matrix.sh
+          python3 -m py_compile tools/configure-memory-geometry.py tools/test-fb-region-validator.py tools/test-pma-guard.py tools/test-memory-geometry-consistency.py
+          bash tools/test-shell-safety.sh
+      - name: Validate supported sources and both 2082 targets
+        run: bash tools/test-source-matrix.sh

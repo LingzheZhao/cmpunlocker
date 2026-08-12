@@ -4,10 +4,11 @@ set -uo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 readonly VENDOR_ID="10de"
-readonly LOG_FILE="/var/log/gen2.log"
+readonly LOG_FILE="/var/log/cmpunlocker-gen2.log"
 readonly TARGET_GEN="${CMP170HX_GEN2_TARGET:-2}"
 readonly MAX_ITERATIONS="${CMP170HX_GEN2_MAX_ITERATIONS:-600}"
 readonly RETRAIN_INTERVAL="${CMP170HX_GEN2_RETRAIN_INTERVAL:-0.05}"
+readonly MAX_SECONDS="${CMP170HX_GEN2_MAX_SECONDS:-40}"
 
 log() {
     local line
@@ -58,61 +59,89 @@ is_pci_bridge() {
     [[ "${class,,}" == 0x0604* ]]
 }
 
-retrain_one() {
-    local gpu="$1"
-    local bridge status generation cap2 iteration initial
+retrain_all() {
+    local -a gpus=("$@")
+    local -a bridges=()
+    local -a completed=()
+    local gpu bridge initial status generation cap2
+    local i round remaining deadline rc=0
 
-    if ! is_supported_gpu "${gpu}"; then
-        log "${gpu}: vendor/device guard failed; refusing to touch the device"
-        return 1
-    fi
-    bridge="$(upstream_bridge "${gpu}" || true)"
-    if [[ -z "${bridge}" ]] || ! is_pci_bridge "${bridge}"; then
-        log "${gpu}: no valid upstream PCI bridge found; skipping"
-        return 1
-    fi
-
-    initial="$(link_generation "${gpu}")"
-    if [[ "${initial}" =~ ^[0-9]+$ ]] && (( initial >= TARGET_GEN )); then
-        log "${gpu}: already Gen${initial}; no retrain needed"
-        return 0
-    fi
-
-    log "${gpu}: start via upstream ${bridge}; initial Gen${initial}; target Gen${TARGET_GEN}"
-    for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
+    for i in "${!gpus[@]}"; do
+        gpu="${gpus[$i]}"
         if ! is_supported_gpu "${gpu}"; then
-            log "${gpu}: disappeared during retrain; stopping immediately"
-            return 1
+            log "${gpu}: vendor/device guard failed; refusing to touch the device"
+            completed[$i]=1
+            bridges[$i]=""
+            rc=1
+            continue
         fi
+        bridge="$(upstream_bridge "${gpu}" || true)"
+        if [[ -z "${bridge}" ]] || ! is_pci_bridge "${bridge}"; then
+            log "${gpu}: no valid upstream PCI bridge found; skipping"
+            completed[$i]=1
+            bridges[$i]=""
+            rc=1
+            continue
+        fi
+        bridges[$i]="${bridge}"
+        initial="$(link_generation "${gpu}")"
+        if [[ "${initial}" =~ ^[0-9]+$ ]] && (( initial >= TARGET_GEN )); then
+            log "${gpu}: already Gen${initial}; no retrain needed"
+            completed[$i]=1
+        else
+            completed[$i]=0
+            log "${gpu}: queued via upstream ${bridge}; initial Gen${initial}; target Gen${TARGET_GEN}"
+            setpci -s "${bridge}" CAP_EXP+30.w=0002:000f 2>/dev/null || true
+            setpci -s "${gpu}" CAP_EXP+30.w=0002:000f 2>/dev/null || true
+        fi
+    done
 
-        setpci -s "${bridge}" CAP_EXP+30.w=0002:000f 2>/dev/null || true
-        setpci -s "${gpu}" CAP_EXP+30.w=0002:000f 2>/dev/null || true
-
-        setpci -s "${bridge}" CAP_EXP+10.w=0020:0020 2>/dev/null || true
-
-        status="$(read_link_status "${gpu}")"
-        if [[ "${status}" =~ ^[[:xdigit:]]{4}$ ]]; then
-            generation=$((0x${status} & 0x0f))
-            if (( generation >= TARGET_GEN )); then
-                cap2="$(setpci -s "${gpu}" CAP_EXP+2c.l 2>/dev/null || echo unreadable)"
-                log "${gpu}: SUCCESS Gen${generation} at iteration ${iteration}; LnkSta=0x${status}; LnkCap2=0x${cap2}"
-                return 0
+    deadline=$((SECONDS + MAX_SECONDS))
+    for ((round = 1; round <= MAX_ITERATIONS && SECONDS < deadline; round++)); do
+        remaining=0
+        for i in "${!gpus[@]}"; do
+            (( completed[$i] == 0 )) || continue
+            gpu="${gpus[$i]}"
+            bridge="${bridges[$i]}"
+            if ! is_supported_gpu "${gpu}" || ! is_pci_bridge "${bridge}"; then
+                log "${gpu}: device or upstream bridge disappeared; stopping attempts"
+                completed[$i]=1
+                rc=1
+                continue
             fi
-        fi
+
+            setpci -s "${bridge}" CAP_EXP+10.w=0020:0020 2>/dev/null || true
+            status="$(read_link_status "${gpu}")"
+            if [[ "${status}" =~ ^[[:xdigit:]]{4}$ ]]; then
+                generation=$((0x${status} & 0x0f))
+                if (( generation >= TARGET_GEN )); then
+                    cap2="$(setpci -s "${gpu}" CAP_EXP+2c.l 2>/dev/null || echo unreadable)"
+                    log "${gpu}: SUCCESS Gen${generation} at round ${round}; LnkSta=0x${status}; LnkCap2=0x${cap2}"
+                    completed[$i]=1
+                    continue
+                fi
+            fi
+            remaining=$((remaining + 1))
+        done
+        (( remaining > 0 )) || break
         sleep "${RETRAIN_INTERVAL}"
     done
 
-    generation="$(link_generation "${gpu}")"
-    log "${gpu}: no Gen2 window caught after ${MAX_ITERATIONS} attempts; final Gen${generation}"
-    return 1
+    for i in "${!gpus[@]}"; do
+        (( completed[$i] == 0 )) || continue
+        generation="$(link_generation "${gpus[$i]}")"
+        log "${gpus[$i]}: no Gen2 window caught within ${MAX_SECONDS}s/${MAX_ITERATIONS} rounds; final Gen${generation}"
+        rc=1
+    done
+    return "${rc}"
 }
 
 main() {
-    local rc=0
+    local resolved
     local -a gpus=()
 
     if [[ "${EUID}" -ne 0 ]]; then
-        echo "gen2-hammer must run as root" >&2
+        echo "cmpunlocker-gen2-hammer must run as root" >&2
         exit 1
     fi
     if [[ "${TARGET_GEN}" != "2" ]]; then
@@ -123,11 +152,28 @@ main() {
         echo "CMP170HX_GEN2_MAX_ITERATIONS must be a positive integer" >&2
         exit 1
     fi
+    if ! [[ "${MAX_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "CMP170HX_GEN2_MAX_SECONDS must be a positive integer" >&2
+        exit 1
+    fi
+    if ! [[ "${RETRAIN_INTERVAL}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "CMP170HX_GEN2_RETRAIN_INTERVAL must be a non-negative number" >&2
+        exit 1
+    fi
     command -v lspci >/dev/null || { echo "lspci is required" >&2; exit 1; }
     command -v setpci >/dev/null || { echo "setpci is required" >&2; exit 1; }
+    command -v modinfo >/dev/null || { echo "modinfo is required" >&2; exit 1; }
+
+    resolved="$(modinfo -k "$(uname -r)" -n nvidia 2>/dev/null || true)"
+    resolved="$(readlink -e -- "${resolved}" 2>/dev/null || true)"
+    if [[ "${resolved}" != */updates/cmpunlocker/nvidia.ko ]] || \
+       ! grep -aEq 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' "${resolved}"; then
+        echo "Refusing PCIe retrain: current kernel does not resolve a v5 cmpunlocker nvidia.ko" >&2
+        exit 1
+    fi
 
     : > "${LOG_FILE}"
-    log "early retrain started (attempts=${MAX_ITERATIONS}, interval=${RETRAIN_INTERVAL}s)"
+    log "early retrain started (global budget=${MAX_SECONDS}s, rounds=${MAX_ITERATIONS}, interval=${RETRAIN_INTERVAL}s)"
 
     mapfile -t gpus < <(
         for id in 20c2 2082; do
@@ -139,11 +185,12 @@ main() {
         return 0
     fi
 
-    for gpu in "${gpus[@]}"; do
-        retrain_one "${gpu}" || rc=1
-    done
-    log "early retrain finished (rc=${rc})"
-    return "${rc}"
+    if retrain_all "${gpus[@]}"; then
+        log "early retrain finished (rc=0)"
+        return 0
+    fi
+    log "early retrain finished (rc=1)"
+    return 1
 }
 
 main "$@"

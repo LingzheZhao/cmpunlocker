@@ -11,15 +11,16 @@
      PACKED_REGISTRY_TABLE *pRegTable;
 --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
-@@ -102,6 +102,304 @@
+@@ -102,6 +102,307 @@
  
  #include "crashcat/crashcat_report.h"
  
 +#define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID   0x20C2
 +#define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID 0x2082
++#define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_SUBDEVICE_ID 0x155710DE
 +#define SEC2_POSTBL_TIMING_SIGNATURE_SIZE          0x0000f800ULL
 +#define SEC2_POSTBL_TIMING_FILL_DWORD              0x000004a7U
-+#define SEC2_POSTBL_TIMING_DMEM_PATH               "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
++/* External SEC2 payload files are intentionally unsupported. */
 +#define SEC2_POSTBL_TIMING_FB_REGION_ALIGNMENT     0x00010000ULL
 +#define SEC2_POSTBL_TIMING_STOCK_8GB_FB_BYTES      0x0000000200000000ULL
 +#define SEC2_POSTBL_TIMING_STOCK_10GB_FB_BYTES     0x0000000280000000ULL
@@ -30,7 +31,7 @@
 + * later target-specific gates reject modes outside that bounded path.
 + */
 +#define SEC2_POSTBL_TIMING_FB_REGION_SETUP_HEADROOM 6U
-+#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT       "cmpunlocker-safety-v4"
++#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT       "cmpunlocker-safety-v5-2082-40g"
 +
 +NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
 +                                           NvU32 writeAddr, NvU32 writeValue);
@@ -40,8 +41,10 @@
 +_kgspSec2PostblTimingEnabled(OBJGPU *pGpu)
 +{
 +    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU32 subDeviceId = pGpu->idInfo.PCISubDeviceID;
 +    return (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID ||
-+            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID);
++            (devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID &&
++             subDeviceId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_SUBDEVICE_ID));
 +}
 +
 +/*
@@ -179,6 +182,7 @@
 +_kgspSec2PostblTimingValidateFbLayout(OBJGPU *pGpu, KernelGsp *pKernelGsp)
 +{
 +    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU32 subDeviceId = pGpu->idInfo.PCISubDeviceID;
 +    NvU64 expectedFbSize =
 +        (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
 +            ? 0x0000001000000000ULL
@@ -200,10 +204,9 @@
 +    NvU64 protectedStart = 0;
 +    const char *pReason = NULL;
 +
-+    if (devId != SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID &&
-+        devId != SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID)
++    if (!_kgspSec2PostblTimingEnabled(pGpu))
 +    {
-+        pReason = "unsupported PCI device";
++        pReason = "unsupported PCI device/subdevice";
 +        goto fail;
 +    }
 +
@@ -304,11 +307,11 @@
 +
 +fail:
 +    NV_PRINTF(LEVEL_ERROR,
-+              "SEC2_DEBUG_FB_LAYOUT: rejected reason=%s devId=0x%x "
++              "SEC2_DEBUG_FB_LAYOUT: rejected reason=%s devId=0x%x subDeviceId=0x%x "
 +              "fb_length=0x%016llx expected=0x%016llx "
 +              "metaMagic=0x%016llx metaRevision=%llu metaFbSize=0x%016llx "
 +              "protectedStart=0x%016llx regions=%u build=%s\n",
-+              pReason, devId, pGSCI->fb_length, expectedFbSize,
++              pReason, devId, subDeviceId, pGSCI->fb_length, expectedFbSize,
 +              metaMagic, metaRevision, metaFbSize, protectedStart,
 +              numRegions, SEC2_POSTBL_TIMING_BUILD_FINGERPRINT);
 +    return NV_ERR_INVALID_STATE;
@@ -613,7 +616,7 @@
 -        pGspFw->pSignatureData, pGspFw->signatureSize);
 +    if (bPostbl)
 +    {
-+        NV_STATUS dmemStatus;
++        /* Always materialize the reviewed, built-in payload. */
 +
 +        if (pGspFw->pSignatureData != NULL && pGspFw->signatureSize > 0)
 +        {
@@ -629,23 +632,23 @@
 +            }
 +        }
 +
-+        dmemStatus = os_open_and_read_file(
-+            SEC2_POSTBL_TIMING_DMEM_PATH, pSignatureVa, sigSize);
-+        if (dmemStatus == NV_OK)
-+        {
-+            NV_PRINTF(LEVEL_ERROR,
-+                      "SEC2_DEBUG: loaded %llu bytes from %s\n",
-+                      (unsigned long long)sigSize, SEC2_POSTBL_TIMING_DMEM_PATH);
-+        }
-+        else
-+        {
-+            NV_PRINTF(LEVEL_ERROR,
-+                      "SEC2_DEBUG: %s not found (0x%x), using built-in payload\n",
-+                      SEC2_POSTBL_TIMING_DMEM_PATH, dmemStatus);
-+            _kgspSec2PostblTimingFillPayload(pSignatureVa,
-+                memdescGetSize(pKernelGsp->pSignatureMemdesc),
-+                0x009a0148U, 0xffffffffU);
-+        }
++        _kgspSec2PostblTimingFillPayload(
++            pSignatureVa,
++            memdescGetSize(pKernelGsp->pSignatureMemdesc),
++            0x009a0148U, 0xffffffffU);
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: initialized built-in post-BL payload "
++                  "(%llu bytes); external payloads are disabled\n",
++                  (unsigned long long)sigSize);
++
++        /*
++         * The executable bytes above are fixed by this source patch.
++         * Leaving no firmware-file override prevents an unreviewed or
++         * stale dmem.bin from changing SEC2 behavior independently of
++         * the module fingerprint and normal boot verification.
++         * This path is deliberately not configurable at runtime.
++         */
 +        memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
 +    }
 +    else

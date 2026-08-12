@@ -3,9 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_DIR}/VERSION")
+declare -A SOURCE_TARBALL_SHA256=(
+    ["610.57.04"]="619d7b5ce1f79c3211afdbf87d02b2174d268b10d005c5b8f994be22299be681"
+    ["610.43.03"]="9df87d753cd9c05aa0eedc462af9b35debb549a657136e863282f94c96ee2640"
+    ["610.43.02"]="62fbbe29527e30be32cb38b30dfad2e94db1ca87f77a58090e563c7669857e60"
+)
 DEFAULT_VERSION="${SUPPORTED_VERSIONS[0]:-}"
 VERSION="${CMPUNLOCKER_DRIVER_VERSION:-${DEFAULT_VERSION}}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
+GEOMETRY_TOOL="${SCRIPT_DIR}/../tools/configure-memory-geometry.py"
+GEOMETRY_CONSISTENCY_TEST="${SCRIPT_DIR}/../tools/test-memory-geometry-consistency.py"
 BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
 SRC_NAME="open-gpu-kernel-modules-${VERSION}"
 SRC_DIR="${BUILD_ROOT}/${SRC_NAME}"
@@ -14,6 +21,8 @@ TARBALL_URL="https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags
 KVER="$(uname -r)"
 KSRC="/lib/modules/${KVER}/build"
 INSTALL_MOD_DIR="/lib/modules/${KVER}/updates/cmpunlocker"
+DEPMOD_OVERRIDE_FILE="/etc/depmod.d/cmpunlocker.conf"
+MODPROBE_OPTIONS_FILE="/etc/modprobe.d/cmp-pcie-gen2.conf"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -36,12 +45,33 @@ version_supported() {
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
+[[ "${CMPUNLOCKER_INSTALL_GATES_OK:-0}" == "1" ]] || \
+    die "driver/build.sh installs kernel modules and must be invoked by the hardware-gated install.sh"
+[[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]] || \
+    die "Validated GPU inventory is required for a fail-closed module install"
+if [[ "${CMPUNLOCKER_LOCK_HELD:-0}" != "1" ]]; then
+    command -v flock &>/dev/null || die "flock is required to serialize module changes"
+    exec 8>/run/lock/cmpunlocker.lock
+    flock -n 8 || die "Another cmpunlocker install/remove operation is already running"
+fi
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
 version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (supported: ${SUPPORTED_VERSIONS[*]})"
+EXPECTED_TARBALL_SHA256="${SOURCE_TARBALL_SHA256[${VERSION}]-}"
+[[ -n "${EXPECTED_TARBALL_SHA256}" ]] || \
+    die "No pinned source archive hash for ${VERSION}"
 [[ -d "${PATCH_DIR}" ]] || die "Missing patches directory: ${PATCH_DIR}"
 [[ -d "${KSRC}" ]] || die "Kernel headers not found at ${KSRC}. Install linux-headers-${KVER} (or kernel-devel)."
 command -v python3 &>/dev/null || die "python3 is required to apply the card memory profile"
 command -v gcc &>/dev/null || die "gcc is required to build modules and run safety checks"
+for required_command in awk curl depmod install mktemp modinfo readlink sha256sum tar; do
+    command -v "${required_command}" &>/dev/null || \
+        die "${required_command} is required for transactional module installation"
+done
+[[ -f "${GEOMETRY_TOOL}" ]] || die "Missing memory geometry configurator: ${GEOMETRY_TOOL}"
+[[ -f "${GEOMETRY_CONSISTENCY_TEST}" ]] || \
+    die "Missing memory geometry consistency test: ${GEOMETRY_CONSISTENCY_TEST}"
+python3 "${GEOMETRY_CONSISTENCY_TEST}" || \
+    die "Memory geometry constants and consumers have drifted"
 info "Building against open-gpu-kernel-modules ${VERSION}"
 
 PATCH_ORDER=(
@@ -64,29 +94,39 @@ for name in "${PATCH_ORDER[@]}"; do
 done
 
 PROFILE="${CMPUNLOCKER_CARD_PROFILE:-8gb}"
-SKIP_GEOMETRY_REWRITE=0
+TEN_GB_TARGET="${CMPUNLOCKER_10GB_TARGET:-40gb}"
+case "${TEN_GB_TARGET}" in
+    40gb|40GB)
+        TEN_GB_TARGET="40gb"
+        BUILD_FINGERPRINT="cmpunlocker-safety-v5-2082-40g"
+        ;;
+    80gb|80GB)
+        TEN_GB_TARGET="80gb"
+        BUILD_FINGERPRINT="cmpunlocker-safety-v5-2082-80g-experimental"
+        ;;
+    *) die "Unknown CMPUNLOCKER_10GB_TARGET='${TEN_GB_TARGET}' (use 40gb or 80gb)" ;;
+esac
+
 case "${PROFILE}" in
     8gb|8GB)
         PROFILE="8gb"
-        CFG1="0x02779000"
-        LMR="0x0000020B"
-        FB_BYTES="0x0000001000000000"
         UNLOCK_LABEL="64GB"
         ;;
     10gb|10GB)
         PROFILE="10gb"
-        CFG1="0x02669000"
-        LMR="0x0000028A"
-        FB_BYTES="0x0000000A00000000"
-        UNLOCK_LABEL="40GB"
+        if [[ "${TEN_GB_TARGET}" == "80gb" ]]; then
+            UNLOCK_LABEL="80GB-experimental"
+        else
+            UNLOCK_LABEL="40GB"
+        fi
         ;;
     mixed|MIXED)
         PROFILE="mixed"
-        CFG1="0x02779000"
-        LMR="0x0000020B"
-        FB_BYTES="0x0000001000000000"
-        UNLOCK_LABEL="mixed"
-        SKIP_GEOMETRY_REWRITE=1
+        if [[ "${TEN_GB_TARGET}" == "80gb" ]]; then
+            UNLOCK_LABEL="64GB+80GB-experimental"
+        else
+            UNLOCK_LABEL="64GB+40GB"
+        fi
         ;;
     *)
         die "Unknown CMPUNLOCKER_CARD_PROFILE='${PROFILE}' (use 8gb, 10gb, or mixed)"
@@ -97,16 +137,21 @@ mkdir -p "${BUILD_ROOT}"
 
 if [[ ! -f "${TARBALL}" ]]; then
     info "Downloading open-gpu-kernel-modules ${VERSION}..."
-    curl -L --fail -o "${TARBALL}.partial" "${TARBALL_URL}"
+    curl --proto '=https' --proto-redir '=https' -L --fail \
+        -o "${TARBALL}.partial" "${TARBALL_URL}"
     mv "${TARBALL}.partial" "${TARBALL}"
     ok "Downloaded ${TARBALL}"
 else
     ok "Using cached tarball ${TARBALL}"
 fi
+actual_tarball_sha256="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+[[ "${actual_tarball_sha256}" == "${EXPECTED_TARBALL_SHA256}" ]] || \
+    die "Source archive checksum mismatch for ${VERSION}: got ${actual_tarball_sha256}"
+ok "Source archive checksum verified"
 
 info "Extracting a clean source tree; safety builds never reuse patched sources or objects"
 rm -rf "${SRC_DIR}"
-tar -xzf "${TARBALL}" -C "${BUILD_ROOT}"
+tar --no-same-owner --no-same-permissions -xzf "${TARBALL}" -C "${BUILD_ROOT}"
 if [[ ! -d "${SRC_DIR}" ]]; then
     extracted="$(find "${BUILD_ROOT}" -maxdepth 1 -type d -name "${SRC_NAME}*" | head -1)"
     [[ -n "${extracted}" ]] || die "Extracted source tree not found"
@@ -125,51 +170,9 @@ ok "All patches applied"
 GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
 [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
 
-info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry)..."
-if [[ "${SKIP_GEOMETRY_REWRITE}" -eq 1 ]]; then
-    info "mixed profile: runtime device-id geometry (no build-time CFG1/LMR rewrite)"
-else
-    python3 - "${GSP_C}" "${CFG1}" "${LMR}" "${FB_BYTES}" "${UNLOCK_LABEL}" <<'PY'
-import pathlib, re, sys
-path, cfg1, lmr, fb, label = sys.argv[1:6]
-text = pathlib.Path(path).read_text()
-if (
-    "SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID" in text
-    and "SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID" in text
-    and "0x02779000U" in text
-    and "0x02669000U" in text
-    and "0x0000001000000000ULL" in text
-    and "0x0000000A00000000ULL" in text
-):
-    print(f"runtime device-id geometry (profile metadata={label})")
-    raise SystemExit(0)
-
-text2, n1 = re.subn(
-    r"(NvU32 cfg1Value = )0x[0-9A-Fa-f]+(U;)",
-    rf"\g<1>{cfg1}\g<2>",
-    text,
-    count=1,
-)
-text2, n2 = re.subn(
-    r"(NvU32 lmrValue\s*=\s*)0x[0-9A-Fa-f]+(U;)",
-    rf"\g<1>{lmr}\g<2>",
-    text2,
-    count=1,
-)
-text2, n3 = re.subn(
-    r"(NvU64 targetFbBytes = )0x[0-9A-Fa-f]+ULL;\s*/\*[^*]*\*/",
-    rf"\g<1>{fb}ULL;  /* {label} */",
-    text2,
-    count=1,
-)
-if n1 != 1 or n2 != 1 or n3 != 1:
-    raise SystemExit(
-        f"geometry rewrite failed (cfg1={n1} lmr={n2} fb={n3}); check kernel_gsp.c markers"
-    )
-pathlib.Path(path).write_text(text2)
-print(f"cfg1={cfg1} lmr={lmr} fb={fb} ({label})")
-PY
-fi
+info "Configuring runtime geometry: 20c2=64GB, 2082=${TEN_GB_TARGET}"
+python3 "${GEOMETRY_TOOL}" "${SRC_DIR}" --ten-gb-target "${TEN_GB_TARGET}" || \
+    die "Could not configure a consistent 10 GB geometry across boot and allocator paths"
 ok "Memory profile ${PROFILE}: unlock_geometry=${UNLOCK_LABEL}"
 
 GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
@@ -189,7 +192,7 @@ HOSTCC=gcc python3 "${PMA_GUARD_TEST}" "${MEM_MGR_C}" || \
     die "Materialized FB/PMA guard source/semantic self-test failed"
 ok "Materialized FB/PMA guard passed compiled fail-closed tests"
 
-python3 - "${MEM_MGR_C}" "${GSP_C}" "${SRC_DIR}" <<'PY'
+python3 - "${MEM_MGR_C}" "${GSP_C}" "${SRC_DIR}" "${BUILD_FINGERPRINT}" <<'PY'
 import pathlib
 import re
 import sys
@@ -368,12 +371,14 @@ def terminal_top_level_statement(text, opening, closing, pattern):
 mem_mgr = pathlib.Path(sys.argv[1])
 gsp_source = pathlib.Path(sys.argv[2])
 source_root = pathlib.Path(sys.argv[3])
+build_fingerprint = sys.argv[4]
 
 mem_text = mem_mgr.read_text(encoding="utf-8")
+gsp_text = gsp_source.read_text(encoding="utf-8")
 guard = mem_text.find("SEC2_DEBUG_PMA_GUARD")
 first_registration = mem_text.find("status = memmgrPmaRegisterRegions(")
 required_guard_markers = (
-    "build=cmpunlocker-safety-v4",
+    f"build={build_fingerprint}",
     "GSP_FW_WPR_META_MAGIC",
     "gspFwHeapSize",
     "pRegion->limit >= pWprMeta->gspFwRsvdStart",
@@ -383,8 +388,9 @@ if guard < 0 or first_registration < 0 or guard >= first_registration:
     raise SystemExit("PMA safety guard is missing or occurs after PMA registration")
 if any(marker not in mem_text for marker in required_guard_markers):
     raise SystemExit("PMA safety guard is missing a fail-closed invariant")
+if f'"{build_fingerprint}"' not in gsp_text:
+    raise SystemExit("GSP build fingerprint does not match the configured geometry")
 
-gsp_text = gsp_source.read_text(encoding="utf-8")
 required_payload_markers = (
     "_kgspSec2PostblTimingEnsurePayloadMemdesc",
     "MEMORY_DESCRIPTOR *pNewSignatureMemdesc = NULL",
@@ -399,6 +405,13 @@ required_payload_markers = (
 )
 if any(marker not in gsp_text for marker in required_payload_markers):
     raise SystemExit("SEC2 retry payload bounds/reallocation guard is missing")
+forbidden_external_payload_markers = (
+    "SEC2_POSTBL_TIMING_DMEM_PATH",
+    "os_open_and_read_file(",
+    '"/lib/firmware/nvidia/ga100/gsp/dmem.bin"',
+)
+if any(marker in gsp_text for marker in forbidden_external_payload_markers):
+    raise SystemExit("unverified external SEC2 payload override remains enabled")
 
 signature_start = gsp_text.find("_kgspCreateSignatureMemdesc\n(")
 signature_end = gsp_text.find(
@@ -719,6 +732,20 @@ if not (
 ):
     raise SystemExit("Booter Unload does not strictly reset SEC2 around failure")
 
+bus_source = (
+    source_root
+    / "src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c"
+)
+bus_text = bus_source.read_text(encoding="utf-8")
+if (
+    bus_text.count("_kbusCmpDefaultBar0Offset(pGpu, pMemoryManager)") != 3
+    or "(pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN)"
+    in bus_text
+    or "nativeFbSizeMb = 0x2000ULL" not in bus_text
+    or "nativeFbSizeMb = 0x2800ULL" not in bus_text
+):
+    raise SystemExit("BAR0 PRAMIN clamp is not consistent across load/resume/destroy")
+
 for tree in (source_root / "src" / "nvidia", source_root / "kernel-open"):
     for path in tree.rglob("*"):
         if path.suffix not in {".c", ".h"}:
@@ -730,17 +757,6 @@ PY
 ok "PMA and payload invariants are ordered correctly; unsafe late-PMA source is absent"
 
 cd "${SRC_DIR}"
-mkdir -p "${INSTALL_MOD_DIR}"
-printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
-printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
-printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
-if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
-    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
-    ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
-else
-    : > "${INSTALL_MOD_DIR}/gpu_inventory"
-fi
-
 info "Building modules for kernel ${KVER}..."
 find . -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
 rm -rf src/nvidia/_out src/nvidia-modeset/_out kernel-open/conftest 2>/dev/null || true
@@ -755,29 +771,20 @@ make -j"${JOBS}" modules SYSSRC="${KSRC}" CC="${CC_CMD}"
 ok "Modules built"
 CORE_MODULE="${SRC_DIR}/kernel-open/nvidia.ko"
 [[ -f "${CORE_MODULE}" ]] || die "Missing canonical built core module: ${CORE_MODULE}"
-grep -aFq 'cmpunlocker-safety-v4' "${CORE_MODULE}" || \
-    die "Built nvidia.ko lacks the required cmpunlocker-safety-v4 marker"
-ok "Built core module contains the cmpunlocker safety-v4 provenance marker"
+grep -aFq "${BUILD_FINGERPRINT}" "${CORE_MODULE}" || \
+    die "Built nvidia.ko lacks the required ${BUILD_FINGERPRINT} marker"
+if grep -aEoq 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' "${CORE_MODULE}"; then
+    marker_count="$(grep -aEo 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' \
+        "${CORE_MODULE}" | sort -u | wc -l)"
+    [[ "${marker_count}" -eq 1 ]] || \
+        die "Built nvidia.ko contains conflicting cmpunlocker geometry markers"
+else
+    die "Built nvidia.ko contains no recognized cmpunlocker geometry marker"
+fi
+ok "Built core module contains geometry-bound marker ${BUILD_FINGERPRINT}"
 if command -v ccache &>/dev/null; then
     ccache -s 2>/dev/null | sed 's/^/  /' || true
 fi
-info "Installing modules to ${INSTALL_MOD_DIR}..."
-mkdir -p "${INSTALL_MOD_DIR}"
-
-mapfile -t KO_FILES < <(find "${SRC_DIR}" -type f \( \
-    -name 'nvidia.ko' -o -name 'nvidia-modeset.ko' -o -name 'nvidia-uvm.ko' \
-    -o -name 'nvidia-drm.ko' -o -name 'nvidia-peermem.ko' \) \
-    ! -path '*/conftest/*' | sort -u)
-[[ ${#KO_FILES[@]} -gt 0 ]] || die "No built nvidia*.ko found"
-
-for ko in "${KO_FILES[@]}"; do
-    base="$(basename "${ko}")"
-    install -m 0644 "${ko}" "${INSTALL_MOD_DIR}/${base}"
-    ok "Installed ${base}"
-done
-
-depmod -a "${KVER}"
-ok "depmod complete"
 rebuild_initramfs() {
     if command -v update-initramfs &>/dev/null; then
         info "Rebuilding initramfs (update-initramfs)..."
@@ -801,14 +808,167 @@ rebuild_initramfs() {
     return 1
 }
 
+MODULE_NAMES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm nvidia_peermem)
+MODULE_FILES=(nvidia.ko nvidia-modeset.ko nvidia-uvm.ko nvidia-drm.ko nvidia-peermem.ko)
+for i in "${!MODULE_FILES[@]}"; do
+    built_module="${SRC_DIR}/kernel-open/${MODULE_FILES[$i]}"
+    [[ -f "${built_module}" ]] || die "Missing canonical built module: ${built_module}"
+    vermagic="$(modinfo -F vermagic "${built_module}" 2>/dev/null || true)"
+    [[ "${vermagic%% *}" == "${KVER}" ]] || \
+        die "${MODULE_FILES[$i]} vermagic '${vermagic}' does not match ${KVER}"
+done
+ok "All five canonical modules have matching vermagic"
+
+verify_module_resolution() {
+    local i module_name module_file resolved expected
+    for i in "${!MODULE_NAMES[@]}"; do
+        module_name="${MODULE_NAMES[$i]}"
+        module_file="${MODULE_FILES[$i]}"
+        resolved="$(modinfo -k "${KVER}" -n "${module_name}" 2>/dev/null || true)"
+        [[ -n "${resolved}" ]] || \
+            die "modinfo cannot resolve ${module_name} for ${KVER}"
+        resolved="$(readlink -e -- "${resolved}" 2>/dev/null || true)"
+        expected="$(readlink -e -- "${INSTALL_MOD_DIR}/${module_file}" 2>/dev/null || true)"
+        [[ -n "${resolved}" && -n "${expected}" && "${resolved}" == "${expected}" ]] || \
+            die "${module_name} resolves to '${resolved:-?}', expected '${expected:-?}'"
+        info "${module_name} resolves to ${resolved}"
+    done
+}
+
+# Keep transaction copies outside /lib/modules/$KVER.  depmod recursively scans
+# that tree, so even a harmless-looking *.new/rollback directory can become a
+# selectable duplicate after an interrupted install.
+INSTALL_STAGE="/lib/modules/.cmpunlocker-stage-${KVER}.$$"
+INSTALL_BACKUP="/lib/modules/.cmpunlocker-rollback-${KVER}.$$"
+TRANSACTION_STATE="$(mktemp -d /var/tmp/cmpunlocker-install.XXXXXX)" || \
+    die "Could not create installation transaction state"
+transaction_active=0
+had_install_dir=0
+had_depmod_override=0
+had_modprobe_options=0
+
+rollback_install() {
+    local rollback_rc=0
+    set +e
+    warn "Installation did not complete; restoring the previous module selection"
+    if [[ -d "${INSTALL_BACKUP}" ]]; then
+        rm -rf -- "${INSTALL_MOD_DIR}" || rollback_rc=1
+        if (( rollback_rc == 0 )); then
+            mv -- "${INSTALL_BACKUP}" "${INSTALL_MOD_DIR}" || rollback_rc=1
+        fi
+    elif (( had_install_dir == 0 )) && \
+         [[ ! -d "${INSTALL_STAGE}" && -d "${INSTALL_MOD_DIR}" ]]; then
+        rm -rf -- "${INSTALL_MOD_DIR}" || rollback_rc=1
+    fi
+    if (( had_depmod_override == 1 )); then
+        install -m 0644 "${TRANSACTION_STATE}/depmod.conf" \
+            "${DEPMOD_OVERRIDE_FILE}" || rollback_rc=1
+    else
+        rm -f -- "${DEPMOD_OVERRIDE_FILE}" || rollback_rc=1
+    fi
+    if (( had_modprobe_options == 1 )); then
+        install -m 0644 "${TRANSACTION_STATE}/modprobe.conf" \
+            "${MODPROBE_OPTIONS_FILE}" || rollback_rc=1
+    else
+        rm -f -- "${MODPROBE_OPTIONS_FILE}" || rollback_rc=1
+    fi
+    depmod -a "${KVER}" || rollback_rc=1
+    rebuild_initramfs || rollback_rc=1
+    if (( rollback_rc == 0 )); then
+        warn "Previous on-disk NVIDIA module selection restored; running modules were untouched"
+    else
+        warn "Automatic rollback was incomplete; rebuild depmod/initramfs before rebooting"
+    fi
+    set -e
+    return "${rollback_rc}"
+}
+
+finish_transaction() {
+    local rc=$?
+    local rollback_succeeded=1
+    trap - EXIT INT TERM
+    if (( transaction_active == 1 )); then
+        if ! rollback_install; then
+            rollback_succeeded=0
+        fi
+    fi
+    rm -rf -- "${INSTALL_STAGE}"
+    if (( transaction_active == 0 || rollback_succeeded == 1 )); then
+        rm -rf -- "${INSTALL_BACKUP}" "${TRANSACTION_STATE}"
+    else
+        warn "Preserved rollback evidence: ${INSTALL_BACKUP} and ${TRANSACTION_STATE}"
+    fi
+    exit "${rc}"
+}
+trap finish_transaction EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+rm -rf -- "${INSTALL_STAGE}" "${INSTALL_BACKUP}"
+mkdir -p "${INSTALL_STAGE}"
+for i in "${!MODULE_FILES[@]}"; do
+    install -m 0644 "${SRC_DIR}/kernel-open/${MODULE_FILES[$i]}" \
+        "${INSTALL_STAGE}/${MODULE_FILES[$i]}"
+done
+printf '%s\n' "${VERSION}" > "${INSTALL_STAGE}/driver_version"
+printf '%s\n' "${PROFILE}" > "${INSTALL_STAGE}/card_profile"
+printf '%s\n' "${TEN_GB_TARGET}" > "${INSTALL_STAGE}/ten_gb_target"
+printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_STAGE}/unlock_geometry"
+printf '%s\n' "${BUILD_FINGERPRINT}" > "${INSTALL_STAGE}/build_fingerprint"
+if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
+    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_STAGE}/gpu_inventory"
+else
+    : > "${INSTALL_STAGE}/gpu_inventory"
+fi
+(
+    cd "${INSTALL_STAGE}"
+    sha256sum "${MODULE_FILES[@]}" driver_version card_profile ten_gb_target \
+        unlock_geometry build_fingerprint gpu_inventory > modules.sha256
+    sha256sum -c modules.sha256 >/dev/null
+)
+ok "Staged and checksummed all patched modules and installation metadata"
+
+mkdir -p "$(dirname "${DEPMOD_OVERRIDE_FILE}")" \
+         "$(dirname "${MODPROBE_OPTIONS_FILE}")"
+if [[ -e "${DEPMOD_OVERRIDE_FILE}" ]]; then
+    cp -a -- "${DEPMOD_OVERRIDE_FILE}" "${TRANSACTION_STATE}/depmod.conf"
+    had_depmod_override=1
+fi
+if [[ -e "${MODPROBE_OPTIONS_FILE}" ]]; then
+    cp -a -- "${MODPROBE_OPTIONS_FILE}" "${TRANSACTION_STATE}/modprobe.conf"
+    had_modprobe_options=1
+fi
+printf '%s\n' \
+    'override nvidia * updates/cmpunlocker' \
+    'override nvidia_modeset * updates/cmpunlocker' \
+    'override nvidia_uvm * updates/cmpunlocker' \
+    'override nvidia_drm * updates/cmpunlocker' \
+    'override nvidia_peermem * updates/cmpunlocker' \
+    > "${TRANSACTION_STATE}/depmod.conf.new"
+printf '%s\n' \
+    'options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"' \
+    > "${TRANSACTION_STATE}/modprobe.conf.new"
+
+transaction_active=1
+if [[ -d "${INSTALL_MOD_DIR}" ]]; then
+    had_install_dir=1
+    mv -- "${INSTALL_MOD_DIR}" "${INSTALL_BACKUP}"
+fi
+mv -- "${INSTALL_STAGE}" "${INSTALL_MOD_DIR}"
+install -m 0644 "${TRANSACTION_STATE}/depmod.conf.new" "${DEPMOD_OVERRIDE_FILE}"
+install -m 0644 "${TRANSACTION_STATE}/modprobe.conf.new" "${MODPROBE_OPTIONS_FILE}"
+
+depmod -a "${KVER}"
+ok "depmod complete with an exact cmpunlocker override"
+verify_module_resolution
 rebuild_initramfs || \
-    die "Could not rebuild initramfs; patched modules are not safe to activate"
-resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
-[[ -n "${resolved}" ]] || \
-    die "modprobe cannot resolve the installed nvidia module for ${KVER}"
-info "modprobe will load: ${resolved}"
-[[ "${resolved}" == *"/updates/cmpunlocker/"* ]] || \
-    die "modprobe resolves outside updates/cmpunlocker: ${resolved}"
+    die "Could not rebuild initramfs; rolling back the patched module selection"
+verify_module_resolution
+
+transaction_active=0
+rm -rf -- "${INSTALL_BACKUP}" "${TRANSACTION_STATE}"
+trap - EXIT INT TERM
+ok "Installed modules, depmod override, and initramfs committed successfully"
 echo ""
 ok "Patched modules installed on disk; the running NVIDIA driver was left untouched"
 warn "Do not hot-reload or warm-reboot this geometry/WPR-changing driver"

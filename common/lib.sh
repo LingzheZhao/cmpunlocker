@@ -11,6 +11,48 @@ warn() { echo -e "${YELLOW}!${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# Return 0 when a module contains a cmpunlocker fingerprint, 1 when a fully
+# readable/decompressible module does not, and 2 when its contents cannot be
+# inspected.  Callers must treat 0 and 2 as unsafe stock candidates.
+module_contains_cmp_marker() {
+    local module_path="$1"
+    local inspection_file marker_status
+    case "${module_path}" in
+        *.zst)
+            command -v zstd &>/dev/null || return 2
+            inspection_file="$(mktemp /var/tmp/cmpunlocker-module.XXXXXX)" || return 2
+            if ! zstd -dc -- "${module_path}" > "${inspection_file}" 2>/dev/null; then
+                rm -f -- "${inspection_file}"
+                return 2
+            fi
+            ;;
+        *.xz)
+            command -v xz &>/dev/null || return 2
+            inspection_file="$(mktemp /var/tmp/cmpunlocker-module.XXXXXX)" || return 2
+            if ! xz -dc -- "${module_path}" > "${inspection_file}" 2>/dev/null; then
+                rm -f -- "${inspection_file}"
+                return 2
+            fi
+            ;;
+        *.gz)
+            command -v gzip &>/dev/null || return 2
+            inspection_file="$(mktemp /var/tmp/cmpunlocker-module.XXXXXX)" || return 2
+            if ! gzip -dc -- "${module_path}" > "${inspection_file}" 2>/dev/null; then
+                rm -f -- "${inspection_file}"
+                return 2
+            fi
+            ;;
+        *)
+            inspection_file="${module_path}"
+            ;;
+    esac
+    marker_status=0
+    grep -aF 'cmpunlocker-safety-' "${inspection_file}" >/dev/null || marker_status=$?
+    [[ "${inspection_file}" == "${module_path}" ]] || rm -f -- "${inspection_file}"
+    (( marker_status == 0 || marker_status == 1 )) || return 2
+    return "${marker_status}"
+}
+
 banner() {
     echo ""
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
@@ -52,9 +94,17 @@ profile_from_devid() {
 }
 
 expected_mib_for_profile() {
-    case "$1" in
+    local profile="$1"
+    local ten_gb_target="${2:-40gb}"
+    case "${profile}" in
         8gb) echo "65536" ;;
-        10gb) echo "40960" ;;
+        10gb)
+            if [[ "${ten_gb_target}" == "80gb" ]]; then
+                echo "81920"
+            else
+                echo "40960"
+            fi
+            ;;
         *) echo "" ;;
     esac
 }
