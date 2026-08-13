@@ -54,6 +54,67 @@ smi_index_for_bus() {
     return 1
 }
 
+runtime_hazards_for_gpu() {
+    local bdf="$1"
+    local gpu_index="$2"
+    local log_text="$3"
+    local xid_bdf="${bdf%.*}"
+
+    {
+        # Xid messages use the PCI address without the function suffix. Match
+        # the complete prefix so a Booter status such as 0x31 cannot be
+        # mistaken for Xid 31.
+        printf '%s\n' "${log_text}" | \
+            grep -F "NVRM: Xid (PCI:${xid_bdf}):" || true
+
+        # The detailed fault and scrub diagnostics use the NVIDIA GPU index.
+        # A region violation is unsafe regardless of the access type; the
+        # historical incidents included both physical and virtual writes.
+        printf '%s\n' "${log_text}" | \
+            grep -F "NVRM: GPU${gpu_index} " | \
+            grep -E 'FAULT_INFO_TYPE_REGION_VIOLATION|_scrubWaitAndSave: Timed out when waiting for scrub jobs to finish\.' || true
+    } | awk '!seen[$0]++'
+}
+
+runtime_hazard_self_test() {
+    local sample hazards
+
+    sample=$'NVRM: Xid (PCI:0000:03:00): 31, pid=658, name=(udev-worker)\n'
+    sample+=$'NVRM: GPU1 Booter failed with non-zero error code: status=0x31\n'
+    sample+=$'NVRM: GPU1 _scrubWaitAndSave: Timed out when waiting for scrub jobs to finish.\n'
+    sample+=$'NVRM: GPU1 FAULT_INFO_TYPE_REGION_VIOLATION ACCESS_TYPE_PHYS_WRITE\n'
+    sample+=$'NVRM: GPU0 _scrubWaitAndSave: Timed out when waiting for scrub jobs to finish.\n'
+    sample+=$'NVRM: Xid (PCI:0000:04:00): 154, GPU recovery action changed\n'
+
+    hazards="$(runtime_hazards_for_gpu "0000:03:00.0" "1" "${sample}")"
+    grep -Fq 'Xid (PCI:0000:03:00): 31,' <<< "${hazards}" || \
+        die "runtime-hazard self-test missed the target Xid"
+    grep -Fq '_scrubWaitAndSave: Timed out' <<< "${hazards}" || \
+        die "runtime-hazard self-test missed the target scrub timeout"
+    grep -Fq 'FAULT_INFO_TYPE_REGION_VIOLATION' <<< "${hazards}" || \
+        die "runtime-hazard self-test missed the target region violation"
+    if grep -Fq 'status=0x31' <<< "${hazards}"; then
+        die "runtime-hazard self-test confused a Booter status with an Xid"
+    fi
+    if grep -Fq 'GPU0 _scrubWaitAndSave' <<< "${hazards}"; then
+        die "runtime-hazard self-test attributed another GPU's scrub timeout"
+    fi
+    if grep -Fq 'PCI:0000:04:00' <<< "${hazards}"; then
+        die "runtime-hazard self-test attributed another PCI device's Xid"
+    fi
+
+    if [[ -n "$(runtime_hazards_for_gpu "0000:03:00.0" "1" \
+        $'NVRM: GPU1 Booter failed with non-zero error code: status=0x31')" ]]; then
+        die "runtime-hazard self-test accepted a Booter-only false positive"
+    fi
+    ok "Runtime memory-hazard matcher self-test passed"
+}
+
+if [[ "${1:-}" == "--self-test-hazards" ]]; then
+    runtime_hazard_self_test
+    exit 0
+fi
+
 banner
 step_init 3
 
@@ -173,6 +234,18 @@ else
             failures=$((failures + 1))
         else
             ok "${bdf}: physical memory allocator matches the validated public range"
+        fi
+
+        runtime_hazards="$(runtime_hazards_for_gpu \
+            "${bdf}" "${gpu_index}" "${kernel_log}")"
+        if [[ -n "${runtime_hazards}" ]]; then
+            err "${bdf}: the current boot contains an NVIDIA Xid, framebuffer region violation, or scrub timeout"
+            while IFS= read -r hazard; do
+                [[ -n "${hazard}" ]] && warn "${hazard}"
+            done <<< "${runtime_hazards}"
+            failures=$((failures + 1))
+        else
+            ok "${bdf}: no matching runtime memory fault in the current boot"
         fi
     done
 fi
