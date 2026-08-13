@@ -38,7 +38,7 @@ GEOMETRIES = {
         lmr="0x0000028B",
         fb_bytes="0x0000001400000000",
         label="80GB-experimental",
-        fingerprint="cmpunlocker-safety-v5-2082-80g-experimental",
+        fingerprint="cmpunlocker-layout-v5-2082-80g-unverified",
     ),
 }
 
@@ -58,7 +58,8 @@ def configure_gsp(text: str, geometry: Geometry) -> str:
     text = replace_one(
         text,
         r'(#define\s+SEC2_POSTBL_TIMING_BUILD_FINGERPRINT\s+)'
-        r'"cmpunlocker-safety-v(?:4|5-2082-(?:40g|80g-experimental))"',
+        r'"(?:cmpunlocker-safety-v(?:4|5-2082-(?:40g|80g-experimental))|'
+        r'cmpunlocker-layout-v5-2082-80g-unverified)"',
         rf'\g<1>"{geometry.fingerprint}"',
         "kernel_gsp build fingerprint",
     )
@@ -111,8 +112,9 @@ def configure_pma_guard(text: str, geometry: Geometry) -> str:
     )
     return replace_one(
         text,
-        r"status=safe build=cmpunlocker-safety-v"
-        r"(?:4|5-2082-(?:40g|80g-experimental))\\n",
+        r"status=safe build=(?:cmpunlocker-safety-v"
+        r"(?:4|5-2082-(?:40g|80g-experimental))|"
+        r"cmpunlocker-layout-v5-2082-80g-unverified)\\n",
         f"status=safe build={geometry.fingerprint}\\\\n",
         "PMA guard build fingerprint",
     )

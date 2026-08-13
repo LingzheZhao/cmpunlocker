@@ -82,10 +82,12 @@ SEC2_DEBUG_FB_LAYOUT: ... status=safe ... build=cmpunlocker-safety-v5-2082-40g
 SEC2_DEBUG_PMA_GUARD: ... status=safe ... build=cmpunlocker-safety-v5-2082-40g
 ```
 
-An 80G build must instead show
-`cmpunlocker-safety-v5-2082-80g-experimental` in both proofs. `verify.sh`
-requires the exact target-specific marker, checks the current PCI inventory,
-and verifies the checksummed module overlay selected by `modinfo`.
+An 80G research build instead shows
+`cmpunlocker-layout-v5-2082-80g-unverified`. Its two `status=safe` fields mean
+only that the individual logical layout and allocator-accounting checks passed;
+they do not prove independent physical HBM cells. `verify.sh` checks the exact
+marker and installed module provenance, then deliberately exits unsuccessfully
+for 80G because physical low/high address uniqueness is unverified.
 
 Any rejected layout, allocator mismatch, or missing check is a stop condition.
 The preceding `cmpunlocker-safety-v3` build completed a post-reboot hardware
@@ -101,7 +103,7 @@ remains experimental and must not be treated as production-stable.
 | Feature | Status |
 |---|---|
 | Full SM compute throughput (SS0/SS1) | Working ✓ |
-| Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`, default); 80 GiB (`10de:2082`, experimental and hardware-unvalidated) |
+| Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`, default); 80 GiB (`10de:2082`, logical-layout research only, physical mapping unverified) |
 | PCIe Gen 2 speeds | Working ✓ |
 | JTAG (Host2Jtag register access) | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |

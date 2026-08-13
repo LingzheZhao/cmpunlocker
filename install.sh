@@ -28,6 +28,8 @@ Usage: sudo ./install.sh [--experimental-80g] [--profile=8gb|10gb]
   --profile=10gb  Assert that the detected hardware is the 10GB/2082 variant
   --experimental-80g
                   Use the experimental 10GB → 80GB geometry on 10de:2082.
+                  This proves only logical layout and allocator accounting;
+                  independent physical HBM addressing remains unverified.
                   The stable default remains 40GB.
   --no-iommu      Do not touch the kernel command line (leave IOMMU settings alone)
   --no-gen2-service
@@ -43,7 +45,8 @@ Without --profile, each unlockable GPU is classified by PCI device ID:
 
 --experimental-80g changes one isolated, whitelisted 10de:2082 card to 80GB.
 It is rejected when another unlockable GPU is present. A cold power cycle and
-verify.sh are mandatory.
+verify.sh are mandatory. verify.sh intentionally returns failure for this mode
+until an address-dependent low/high physical-alias test has passed.
 
 Multi-GPU and mixed 8GB+10GB systems are supported only for the default target.
 EOF

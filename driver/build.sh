@@ -102,7 +102,7 @@ case "${TEN_GB_TARGET}" in
         ;;
     80gb|80GB)
         TEN_GB_TARGET="80gb"
-        BUILD_FINGERPRINT="cmpunlocker-safety-v5-2082-80g-experimental"
+        BUILD_FINGERPRINT="cmpunlocker-layout-v5-2082-80g-unverified"
         ;;
     *) die "Unknown CMPUNLOCKER_10GB_TARGET='${TEN_GB_TARGET}' (use 40gb or 80gb)" ;;
 esac
@@ -773,8 +773,8 @@ CORE_MODULE="${SRC_DIR}/kernel-open/nvidia.ko"
 [[ -f "${CORE_MODULE}" ]] || die "Missing canonical built core module: ${CORE_MODULE}"
 grep -aFq "${BUILD_FINGERPRINT}" "${CORE_MODULE}" || \
     die "Built nvidia.ko lacks the required ${BUILD_FINGERPRINT} marker"
-if grep -aEoq 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' "${CORE_MODULE}"; then
-    marker_count="$(grep -aEo 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' \
+if grep -aEoq 'cmpunlocker-(safety-v5-2082-40g|layout-v5-2082-80g-unverified)' "${CORE_MODULE}"; then
+    marker_count="$(grep -aEo 'cmpunlocker-(safety-v5-2082-40g|layout-v5-2082-80g-unverified)' \
         "${CORE_MODULE}" | sort -u | wc -l)"
     [[ "${marker_count}" -eq 1 ]] || \
         die "Built nvidia.ko contains conflicting cmpunlocker geometry markers"

@@ -63,7 +63,7 @@ for known_dir in /lib/modules/*/updates/cmpunlocker*; do
         die "Refusing ambiguous module directory ${known_dir}"
     fi
     [[ -f "${known_dir}/nvidia.ko" ]] && \
-        grep -aFq 'cmpunlocker-safety-' "${known_dir}/nvidia.ko" || \
+        grep -aEq 'cmpunlocker-(safety|layout)-' "${known_dir}/nvidia.ko" || \
         die "Refusing unrecognized or corrupt cmpunlocker module directory ${known_dir}"
     [[ -s "${known_dir}/driver_version" ]] || \
         die "Refusing cmpunlocker module directory without driver-version recovery metadata: ${known_dir}"
@@ -83,7 +83,7 @@ for pending_dir in /lib/modules/.cmpunlocker-remove-*; do
           ! -d "/lib/modules/${pending_kernel}" || \
           ! -s "${pending_dir}/driver_version" || \
           ! -f "${pending_dir}/nvidia.ko" ]] || \
-       ! grep -aFq 'cmpunlocker-safety-' "${pending_dir}/nvidia.ko"; then
+       ! grep -aEq 'cmpunlocker-(safety|layout)-' "${pending_dir}/nvidia.ko"; then
         warn "Preserving unrecognized out-of-tree directory ${pending_dir}"
         continue
     fi

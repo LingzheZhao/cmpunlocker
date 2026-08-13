@@ -54,5 +54,5 @@ profiles:
     cfg1: "0x02779000"
     lmr: "0x0000028B"
     fb_bytes: "0x0000001400000000"
-    build_fingerprint: "cmpunlocker-safety-v5-2082-80g-experimental"
+    build_fingerprint: "cmpunlocker-layout-v5-2082-80g-unverified"
     experimental: true

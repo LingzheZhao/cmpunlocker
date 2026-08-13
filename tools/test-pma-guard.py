@@ -512,7 +512,7 @@ def fingerprint_for_target(target: str) -> str:
     if target == "0x0000000A00000000ULL":
         return "cmpunlocker-safety-v5-2082-40g"
     if target == "0x0000001400000000ULL":
-        return "cmpunlocker-safety-v5-2082-80g-experimental"
+        return "cmpunlocker-layout-v5-2082-80g-unverified"
     die(f"unsupported 10GB-card PMA target {target}")
 
 

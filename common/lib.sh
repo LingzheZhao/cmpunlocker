@@ -47,7 +47,7 @@ module_contains_cmp_marker() {
             ;;
     esac
     marker_status=0
-    grep -aF 'cmpunlocker-safety-' "${inspection_file}" >/dev/null || marker_status=$?
+    grep -aE 'cmpunlocker-(safety|layout)-' "${inspection_file}" >/dev/null || marker_status=$?
     [[ "${inspection_file}" == "${module_path}" ]] || rm -f -- "${inspection_file}"
     (( marker_status == 0 || marker_status == 1 )) || return 2
     return "${marker_status}"

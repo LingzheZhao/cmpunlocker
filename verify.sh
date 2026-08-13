@@ -99,7 +99,7 @@ done
 TEN_GB_TARGET="$(cat "${TEN_GB_TARGET_FILE}")"
 case "${TEN_GB_TARGET}" in
     40gb) BUILD_FINGERPRINT="cmpunlocker-safety-v5-2082-40g" ;;
-    80gb) BUILD_FINGERPRINT="cmpunlocker-safety-v5-2082-80g-experimental" ;;
+    80gb) BUILD_FINGERPRINT="cmpunlocker-layout-v5-2082-80g-unverified" ;;
     *) die "Invalid installed 10GB target '${TEN_GB_TARGET}' in ${TEN_GB_TARGET_FILE}" ;;
 esac
 
@@ -271,7 +271,7 @@ installed_fingerprint="$(cat "${INSTALL_MOD_DIR}/build_fingerprint")"
     die "Installed fingerprint '${installed_fingerprint:-missing}' does not match target ${BUILD_FINGERPRINT}"
 grep -aFq "${BUILD_FINGERPRINT}" "${INSTALL_MOD_DIR}/nvidia.ko" || \
     die "Installed nvidia.ko does not contain ${BUILD_FINGERPRINT}"
-marker_count="$({ grep -aEo 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' \
+marker_count="$({ grep -aEo 'cmpunlocker-(safety-v5-2082-40g|layout-v5-2082-80g-unverified)' \
     "${INSTALL_MOD_DIR}/nvidia.ko" || true; } | sort -u | wc -l | tr -d '[:space:]')"
 [[ "${marker_count}" -eq 1 ]] || \
     die "Installed nvidia.ko has missing or conflicting geometry fingerprints"
@@ -422,6 +422,12 @@ else
     done
 fi
 
+if [[ "${TEN_GB_TARGET}" == "80gb" ]]; then
+    err "80GB checks prove logical layout and allocator accounting only; independent physical HBM address mapping is unverified"
+    err "A successful same-address write/read cannot exclude upper-to-lower address aliasing"
+    failures=$((failures + 1))
+fi
+
 echo ""
 if [[ -r "${INSTALL_MOD_DIR}/card_profile" ]]; then
     info "Installed profile: $(cat "${INSTALL_MOD_DIR}/card_profile") / geometry: $(cat "${INSTALL_MOD_DIR}/unlock_geometry" 2>/dev/null || echo '?') / 10GB target: ${TEN_GB_TARGET}"
@@ -433,7 +439,7 @@ if (( failures > 0 )); then
 fi
 
 echo ""
-ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory with safe allocator proofs"
+ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory with validated allocator proofs"
 
 if [[ -x "${SCRIPT_DIR}/tools/service.sh" ]]; then
     echo ""

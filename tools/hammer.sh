@@ -167,7 +167,7 @@ main() {
     resolved="$(modinfo -k "$(uname -r)" -n nvidia 2>/dev/null || true)"
     resolved="$(readlink -e -- "${resolved}" 2>/dev/null || true)"
     if [[ "${resolved}" != */updates/cmpunlocker/nvidia.ko ]] || \
-       ! grep -aEq 'cmpunlocker-safety-v5-2082-(40g|80g-experimental)' "${resolved}"; then
+       ! grep -aEq 'cmpunlocker-(safety-v5-2082-40g|layout-v5-2082-80g-unverified)' "${resolved}"; then
         echo "Refusing PCIe retrain: current kernel does not resolve a v5 cmpunlocker nvidia.ko" >&2
         exit 1
     fi

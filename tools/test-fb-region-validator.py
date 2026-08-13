@@ -431,7 +431,7 @@ def fingerprint_for_target(target: str) -> str:
     if target == TEN_GB_FB_40:
         return "cmpunlocker-safety-v5-2082-40g"
     if target == TEN_GB_FB_80:
-        return "cmpunlocker-safety-v5-2082-80g-experimental"
+        return "cmpunlocker-layout-v5-2082-80g-unverified"
     die(f"unsupported 10 GB target {target}")
 
 
