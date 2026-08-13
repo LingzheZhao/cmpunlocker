@@ -86,6 +86,10 @@ coverage but has not completed the same hardware test.
 | JTAG (Host2Jtag register access) | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |
 
+BAR1 peer-to-peer support is not enabled by this branch. The donor analysis,
+platform constraints, and required real-transfer acceptance are documented in
+[the BAR1 peer-to-peer research plan](docs/BAR1-P2P.md).
+
 ---
 
 ## Uninstall
