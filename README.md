@@ -105,6 +105,7 @@ remains experimental and must not be treated as production-stable.
 | Full SM compute throughput (SS0/SS1) | Working ✓ |
 | Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`, default); 80 GiB (`10de:2082`, logical-layout research only, physical mapping unverified) |
 | PCIe Gen 2 speeds | Working ✓ |
+| Full BAR1 Size (64GB) | Working ✓ |
 | JTAG (Host2Jtag register access) | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |
 

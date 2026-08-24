@@ -123,6 +123,13 @@ SEC2_DEBUG: PCIe post CAP=... STAT=... speed=2
 
 ---
 
+### BAR1 resize (64GB)
+
+During PCI probe, before GSP boot, cmpunlocker unlocks Resizable BAR on
+`10de:20c2` and `10de:2082` and attempts to grow BAR1 up to 64GB.
+
+---
+
 ### JTAG (Host2Jtag)
 
 Host2Jtag register access is locked behind the same class of PLM permission as the Booter and memory controller:
