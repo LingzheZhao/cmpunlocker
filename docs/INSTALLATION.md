@@ -30,14 +30,9 @@ sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
 
-GPU-to-GPU P2P is off by default. Enable the BAR1 P2P path with:
-
-```bash
-sudo ./install.sh --p2p
-```
-
-`--p2p` also adds `pci=realloc pci=hpmmioprefsize=2T` to the kernel command
-line. 64GB BAR1 on every GPU is required; the optional host-kernel patches in
+GPU-to-GPU BAR1 P2P is on by default. Pass `--no-p2p` to leave it off. When
+enabled, the installer also adds `pci=realloc pci=hpmmioprefsize=2T`. 64GB
+BAR1 on every GPU is required; the optional host-kernel patches in
 `kernel-patches/` are what make that BAR come up from a normal boot. After
 reboot, `nvidia-smi topo -p2p r` reporting OK is not proof — verify with a
 real peer copy.

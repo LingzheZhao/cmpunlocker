@@ -11,25 +11,27 @@ LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
 PROFILE_OVERRIDE=""
 CONFIGURE_IOMMU=1
 CONFIGURE_GEN2_SERVICE=1
-ENABLE_P2P=0
+ENABLE_P2P=1
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
         --p2p) ENABLE_P2P=1 ;;
+        --no-p2p) ENABLE_P2P=0 ;;
         --no-iommu) CONFIGURE_IOMMU=0 ;;
         --no-gen2-service) CONFIGURE_GEN2_SERVICE=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--p2p] [--no-iommu] [--no-gen2-service]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-p2p] [--no-iommu] [--no-gen2-service]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
-  --p2p           Enable GPU-to-GPU BAR1 P2P (cudaDeviceEnablePeerAccess).
-                  Off by default. Requires 64GB BAR1 on every GPU; the host
-                  kernel patches in kernel-patches/ are needed for that BAR
-                  to come up from a normal boot. nvidia-smi topo -p2p is not
-                  proof — verify with a real peer copy.
+  --no-p2p        Disable GPU-to-GPU BAR1 P2P. It is on by default.
+                  BAR1 P2P needs 64GB BAR1 on every GPU; the host kernel
+                  patches in kernel-patches/ are needed for that BAR to come
+                  up from a normal boot. nvidia-smi topo -p2p is not proof —
+                  verify with a real peer copy.
+  --p2p           Explicitly enable BAR1 P2P (the default)
   --no-iommu      Do not add IOMMU passthrough kernel parameters
   --no-gen2-service
                   Do not install the early-boot PCIe Gen2 retrain service
@@ -134,7 +136,7 @@ if (( ENABLE_P2P == 1 )); then
         warn "Only one unlockable GPU is present; P2P has no peer until a second card is added"
     fi
 else
-    info "P2P left off (use --p2p to enable BAR1 P2P)"
+    info "P2P left off (--no-p2p)"
 fi
 export CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}"
 

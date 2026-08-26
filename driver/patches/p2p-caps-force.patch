@@ -8,7 +8,7 @@
 +    //
 +    // cmpunlocker P2P: GSP reports PCIe P2P unsupported on CMP. BAR1 P2P is the
 +    // working path; force the advertised caps to OK so CUDA and nvidia-smi see
-+    // it. This is compiled in only when --p2p selected the P2P patches.
++    // it. This is compiled in when BAR1 P2P is enabled (the install default).
 +    //
 +    {
 +        NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;

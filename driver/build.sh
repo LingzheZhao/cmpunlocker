@@ -63,7 +63,7 @@ P2P_PATCH_ORDER=(
     p2p-bar1-readcap-override.patch
     p2p-caps-force.patch
 )
-ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-0}"
+ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-1}"
 case "${ENABLE_P2P}" in
     0|"") ENABLE_P2P=0 ;;
     1) ENABLE_P2P=1 ;;
@@ -73,7 +73,7 @@ if (( ENABLE_P2P == 1 )); then
     PATCH_ORDER+=("${P2P_PATCH_ORDER[@]}")
     info "GPU-to-GPU BAR1 P2P patches enabled"
 else
-    info "GPU-to-GPU P2P left off (pass --p2p to enable BAR1 P2P)"
+    info "GPU-to-GPU P2P left off (CMPUNLOCKER_ENABLE_P2P=0)"
 fi
 PATCH_FILES=()
 for name in "${PATCH_ORDER[@]}"; do

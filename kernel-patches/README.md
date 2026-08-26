@@ -6,7 +6,7 @@ unlock — that all works on a stock kernel. They exist to make **BAR1 P2P**
 usable, and to make the large BAR1 come up on a normal boot instead of needing
 a `kexec` trick.
 
-`sudo ./install.sh --p2p` patches the NVIDIA modules and writes
+A default `install.sh` run patches the NVIDIA modules and writes
 `RMForceStaticBar1=1` / `RMPcieP2PType=1`. Without these kernel patches, some
 GPUs silently keep a 64MB BAR1 and BAR1 P2P cannot cover framebuffer.
 
