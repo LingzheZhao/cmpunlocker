@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""Compile and exercise cmpunlocker's final materialized FB/PMA guard.
+
+The target guard is brace-aware extracted from the final patched mem_mgr.c,
+including the standard PMA registration and its post-registration accounting
+check.  A userspace C harness supplies only the NVIDIA types and calls used by
+that exact source segment.  This provides executable fail-closed regression
+coverage without modifying the driver source tree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import NoReturn
+
+
+FUNCTION_NAME = "memmgrCreateHeap_IMPL"
+PREHEAP_HELPER = "_memmgrCmpValidatePreHeapRegionState"
+RESERVED_INSERT_HELPER = "_memmgrCmpValidateReservedRegionInsertion"
+PRE_GUARD_ANCHOR = "NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;"
+REGISTRATION_ANCHOR = "status = memmgrPmaRegisterRegions("
+POST_GUARD_ANCHOR = "if (devId == 0x20C2 || devId == 0x2082)"
+ENCLOSING_GUARD_ANCHOR = (
+    "if ((memmgrIsPmaInitialized(pMemoryManager)) && "
+    "(pMemoryManager->pHeap->bHasFbRegions))"
+)
+
+
+def die(message: str) -> NoReturn:
+    raise SystemExit(f"PMA-guard self-test: {message}")
+
+
+def find_matching_brace(text: str, opening: int) -> int:
+    """Return the matching closing brace, ignoring comments and literals."""
+
+    depth = 0
+    index = opening
+    state = "code"
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+
+        if state == "code":
+            if char == "/" and following == "/":
+                state = "line_comment"
+                index += 2
+                continue
+            if char == "/" and following == "*":
+                state = "block_comment"
+                index += 2
+                continue
+            if char == '"':
+                state = "string"
+            elif char == "'":
+                state = "character"
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+        elif state == "line_comment":
+            if char == "\n":
+                state = "code"
+        elif state == "block_comment":
+            if char == "*" and following == "/":
+                state = "code"
+                index += 2
+                continue
+        elif state in {"string", "character"}:
+            if char == "\\":
+                index += 2
+                continue
+            if (state == "string" and char == '"') or (
+                state == "character" and char == "'"
+            ):
+                state = "code"
+
+        index += 1
+
+    die("unterminated brace-delimited source block")
+
+
+def mask_c_comments_and_literals(text: str) -> str:
+    """Replace comments and literals with spaces while preserving offsets."""
+
+    masked = list(text)
+    index = 0
+    state = "code"
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+
+        if state == "code":
+            if char == "/" and following == "/":
+                masked[index] = masked[index + 1] = " "
+                state = "line_comment"
+                index += 2
+                continue
+            if char == "/" and following == "*":
+                masked[index] = masked[index + 1] = " "
+                state = "block_comment"
+                index += 2
+                continue
+            if char == '"':
+                masked[index] = " "
+                state = "string"
+            elif char == "'":
+                masked[index] = " "
+                state = "character"
+        elif state == "line_comment":
+            if char == "\n":
+                state = "code"
+            else:
+                masked[index] = " "
+        elif state == "block_comment":
+            if char == "*" and following == "/":
+                masked[index] = masked[index + 1] = " "
+                state = "code"
+                index += 2
+                continue
+            if char != "\n":
+                masked[index] = " "
+        elif state in {"string", "character"}:
+            if char == "\\":
+                masked[index] = " "
+                if index + 1 < len(text) and text[index + 1] != "\n":
+                    masked[index + 1] = " "
+                index += 2
+                continue
+            if (state == "string" and char == '"') or (
+                state == "character" and char == "'"
+            ):
+                state = "code"
+            if char != "\n":
+                masked[index] = " "
+
+        index += 1
+
+    return "".join(masked)
+
+
+def find_unconditional_top_level_statement(
+    text: str, opening: int, closing: int, pattern: str
+) -> int:
+    """Find a terminal unconditional statement directly in one braced block."""
+
+    code = mask_c_comments_and_literals(text)
+    for match in re.finditer(pattern, code[opening + 1 : closing]):
+        position = opening + 1 + match.start()
+        depth = 1
+        paren_depth = 0
+        statement_start = opening + 1
+
+        for index in range(opening + 1, position):
+            char = code[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 1:
+                    statement_start = index + 1
+            elif depth == 1:
+                if char == "(":
+                    paren_depth += 1
+                elif char == ")" and paren_depth > 0:
+                    paren_depth -= 1
+                elif char == ";" and paren_depth == 0:
+                    statement_start = index + 1
+
+        statement_end = opening + 1 + match.end()
+        block_prefix = code[opening + 1 : position]
+        block_suffix = code[statement_end:closing]
+        forbidden_control = re.search(
+            r"\b(?:break|continue|do|for|goto|if|return|switch|while)\b",
+            block_prefix,
+        )
+        if (
+            depth == 1
+            and not code[statement_start:position].strip()
+            and not block_suffix.strip()
+            and forbidden_control is None
+            and "#" not in block_prefix
+        ):
+            return position
+
+    return -1
+
+
+def extract_function(text: str, name: str) -> str:
+    """Brace-aware extraction of a named C function definition."""
+
+    name_match = re.search(rf"(?m)^\s*{re.escape(name)}\s*$", text)
+    if name_match is None:
+        die(f"missing {name} definition")
+
+    return_types = list(
+        re.finditer(
+            r"(?m)^(?:static\s+)?NV_STATUS\s*$", text[: name_match.start()]
+        )
+    )
+    if not return_types:
+        die(f"cannot locate return type for {name}")
+    start = return_types[-1].start()
+    opening = text.find("{", name_match.end())
+    if opening < 0:
+        die(f"cannot locate opening brace for {name}")
+    closing = find_matching_brace(text, opening)
+    return text[start : closing + 1]
+
+
+def extract_guard_segment(function: str) -> str:
+    """Extract pre-guard, standard registration, and post-accounting guard."""
+
+    start = function.find(PRE_GUARD_ANCHOR)
+    registration = function.find(REGISTRATION_ANCHOR, start)
+    registration_assert = function.find(
+        "NV_ASSERT_OR_RETURN(status == NV_OK, status);", registration
+    )
+    post_if = function.find(POST_GUARD_ANCHOR, registration_assert)
+    if min(start, registration, registration_assert, post_if) < 0:
+        die("cannot locate the complete materialized FB/PMA guard sequence")
+
+    opening = function.find("{", post_if + len(POST_GUARD_ANCHOR))
+    if opening < 0:
+        die("cannot locate post-registration PMA guard body")
+    closing = find_matching_brace(function, opening)
+    segment = function[start : closing + 1]
+    if segment.count(REGISTRATION_ANCHOR) != 1:
+        die("guard segment must contain exactly one standard PMA registration")
+    return segment
+
+
+def validate_source_shape(
+    function: str, segment: str, preheap_helper: str, reserved_text: str
+) -> None:
+    """Require the invariants and their ordering before compiling the segment."""
+
+    required_pre_markers = (
+        "GSP_FW_WPR_META_MAGIC",
+        "GSP_FW_WPR_META_REVISION",
+        "pWprMeta->fbSize != targetFbBytes",
+        "fbAddrSpaceBytes != targetFbBytes",
+        "pWprMeta->gspFwRsvdStart != pWprMeta->nonWprHeapOffset",
+        "pWprMeta->nonWprHeapSize !=",
+        "pWprMeta->gspFwWprStart - pWprMeta->nonWprHeapOffset",
+        "pMemoryManager->pHeap->base >= pWprMeta->fbSize",
+        "PMA_QUERY_NUMA_ONLINED",
+        "pmaQueryConfigs(",
+        "pMemoryManager->Ram.numFBRegions > MAX_FB_REGIONS",
+        "pRegion->base != expectedBase",
+        "(pRegion->base & 0xffffULL) != 0",
+        "((pRegion->limit + 1) & 0xffffULL) != 0",
+        "pRegion->rsvdSize > currentRegionBytes",
+        "pRegion->rsvdSize != currentRegionBytes",
+        "pRegion->rsvdSize != 0 || pRegion->bProtected",
+        "pRegion->limit >= pWprMeta->gspFwRsvdStart",
+        "nativePublicBytes < pWprMeta->fbSize - 0x80000000ULL",
+        "clippedBase = NV_MAX(",
+        "clippedEndExclusive = NV_MIN(",
+        "pTopRegion->base != pWprMeta->gspFwRsvdStart",
+        "pTopRegion->limit + 1 != pWprMeta->fbSize",
+        "!pTopRegion->bRsvdRegion",
+        "pTopRegion->rsvdSize != protectedBytes",
+        "validatedPublicBytes = pmaPublicBytes",
+    )
+    missing = [marker for marker in required_pre_markers if marker not in segment]
+    if missing:
+        die(f"materialized pre-registration guard is missing invariant: {missing[0]}")
+    if re.search(
+        r"pMemoryManager->Ram\.numFBRegions\s*==\s*0\s*\|\|\s*"
+        r"pMemoryManager->Ram\.numFBRegions\s*>\s*MAX_FB_REGIONS",
+        segment,
+    ) is None:
+        die("materialized region-count guard must reject zero or excess entries")
+
+    pre = segment.find(PRE_GUARD_ANCHOR)
+    registration = segment.find(REGISTRATION_ANCHOR)
+    registration_assert = segment.find(
+        "NV_ASSERT_OR_RETURN(status == NV_OK, status);", registration
+    )
+    total_query = segment.find("pmaGetTotalMemory(", registration_assert)
+    equality = segment.find("if (pmaBytes != validatedPublicBytes)", total_query)
+    refusal = segment.find("return NV_ERR_INVALID_STATE;", equality)
+    safe_log = segment.find(
+        '"status=safe build=cmpunlocker-safety-v4\\n"', equality
+    )
+    if not (
+        0
+        <= pre
+        < registration
+        < registration_assert
+        < total_query
+        < equality
+        < refusal
+        < safe_log
+    ):
+        die(
+            "PMA registration, total query, equality refusal, and safe log "
+            "are not ordered fail-closed"
+        )
+
+    outer_registration = function.find(REGISTRATION_ANCHOR)
+    if outer_registration < 0 or function.find(PRE_GUARD_ANCHOR) >= outer_registration:
+        die("materialized FB guard does not precede standard PMA registration")
+    if function.count(REGISTRATION_ANCHOR) != 1:
+        die("memmgrCreateHeap_IMPL must contain exactly one PMA registration")
+
+    enclosing_if = function.find(ENCLOSING_GUARD_ANCHOR)
+    if enclosing_if < 0:
+        die("PMA registration is missing its initialized/FB-regions enclosure")
+    enclosing_open = function.find(
+        "{", enclosing_if + len(ENCLOSING_GUARD_ANCHOR)
+    )
+    if enclosing_open < 0:
+        die("cannot locate initialized/FB-regions enclosure body")
+    enclosing_close = find_matching_brace(function, enclosing_open)
+    pre_in_function = function.find(PRE_GUARD_ANCHOR)
+    post_total_in_function = function.find("pmaGetTotalMemory(", outer_registration)
+    segment_end_in_function = pre_in_function + len(segment)
+    if not (
+        enclosing_open
+        < pre_in_function
+        < outer_registration
+        < post_total_in_function
+        < segment_end_in_function
+        < enclosing_close
+    ):
+        die(
+            "pre-guard, standard registration, and post-check must share the "
+            "initialized/FB-regions enclosure"
+        )
+
+    required_preheap_markers = (
+        "maxFbRegions <= CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM",
+        "bVirtual || bNumaOnlining || bSizeOverrideActive",
+        "overrideHeapMax != ~0ULL || overrideInitHeapMin != 0",
+        "numFbRegions == 0",
+        "maxFbRegions - CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM",
+    )
+    missing = [marker for marker in required_preheap_markers if marker not in preheap_helper]
+    if missing:
+        die(f"pre-heap capacity helper is missing invariant: {missing[0]}")
+
+    function_code = mask_c_comments_and_literals(function)
+    helper_call = function_code.find(f"status = {PREHEAP_HELPER}(")
+    required_preheap_call_markers = (
+        "cmpDevId,",
+        "pMemoryManager->Ram.numFBRegions,",
+        "MAX_FB_REGIONS,",
+        "IS_VIRTUAL(pGpu),",
+        "osNumaOnliningEnabled(pGpu->pOsGpuInfo),",
+        "pMemoryManager->Ram.fbTotalMemSizeMb >",
+        "pMemoryManager->Ram.fbOverrideSizeMb,",
+        "pMemoryManager->overrideHeapMax,",
+        "pMemoryManager->overrideInitHeapMin);",
+    )
+    helper_call_end = function_code.find(");", helper_call) + 2
+    helper_call_text = function[helper_call:helper_call_end]
+    missing = [
+        marker for marker in required_preheap_call_markers
+        if marker not in helper_call_text
+    ]
+    if missing:
+        die(f"pre-heap helper call does not use live state: {missing[0]}")
+    helper_check = function_code.find("if (status != NV_OK)", helper_call)
+    size_override = function_code.find(
+        "memmgrHandleSizeOverrides_HAL(", helper_check
+    )
+    heap_init = function_code.find("status = heapInit(", size_override)
+    helper_check_open = function_code.find(
+        "{", helper_check + len("if (status != NV_OK)")
+    )
+    if helper_check_open < 0:
+        die("cannot locate pre-heap helper failure block")
+    helper_check_close = find_matching_brace(function_code, helper_check_open)
+    helper_return = find_unconditional_top_level_statement(
+        function,
+        helper_check_open,
+        helper_check_close,
+        r"\breturn\s+status\s*;",
+    )
+    if not (
+        0
+        <= helper_call
+        < helper_check
+        < helper_check_open
+        < helper_return
+        < helper_check_close
+        < size_override
+        < heap_init
+    ):
+        die(
+            "pre-heap helper failure block must return status before size "
+            "override and heapInit"
+        )
+
+    reserved_helper = extract_function(reserved_text, RESERVED_INSERT_HELPER)
+    required_reserved_markers = (
+        "numFbRegions > maxFbRegions",
+        "insertSize == 0",
+        "insertSize > usableBytes",
+        "containingParents != 1",
+        "hostBase > hostLimit",
+        "insertBase < hostBase",
+        "insertSize - 1 > hostLimit - insertBase",
+        "requiredSlots > maxFbRegions - numFbRegions",
+    )
+    missing = [marker for marker in required_reserved_markers if marker not in reserved_helper]
+    if missing:
+        die(f"reserved-region helper is missing invariant: {missing[0]}")
+
+    reserved_code = mask_c_comments_and_literals(reserved_text)
+    reserved_call = reserved_code.find(
+        f"NV_STATUS cmpStatus = {RESERVED_INSERT_HELPER}("
+    )
+    required_reserved_call_markers = (
+        "cmpDevId,",
+        "pMemoryManager->Ram.numFBRegions,",
+        "MAX_FB_REGIONS,",
+        "pHostRegion->base,",
+        "pHostRegion->limit,",
+        "pMemoryManager->rsvdMemoryBase,",
+        "pMemoryManager->rsvdMemorySize,",
+        "pMemoryManager->Ram.fbUsableMemSize,",
+        "containingParents);",
+    )
+    reserved_call_end = reserved_code.find(");", reserved_call) + 2
+    reserved_call_text = reserved_text[reserved_call:reserved_call_end]
+    missing = [
+        marker for marker in required_reserved_call_markers
+        if marker not in reserved_call_text
+    ]
+    if missing:
+        die(f"reserved-region helper call does not use live state: {missing[0]}")
+    count_refusal = reserved_code.find(
+        "pMemoryManager->Ram.numFBRegions == 0"
+    )
+    host_dereference = reserved_code.find(
+        "&pMemoryManager->Ram.fbRegion[rsvdRegion]", count_refusal
+    )
+    pre_dereference = reserved_code[count_refusal:host_dereference]
+    for marker in (
+        "pMemoryManager->Ram.numFBRegions == 0",
+        "pMemoryManager->Ram.numFBRegions > MAX_FB_REGIONS",
+        "rsvdRegion >= pMemoryManager->Ram.numFBRegions",
+        "return NV_ERR_INVALID_STATE;",
+    ):
+        if marker not in pre_dereference:
+            die(f"pre-insertion count refusal is missing: {marker}")
+    reserved_check = reserved_code.find("if (cmpStatus != NV_OK)", reserved_call)
+    usable_mutation = reserved_code.find(
+        "pMemoryManager->Ram.fbUsableMemSize -=", reserved_check
+    )
+    insertion = reserved_code.find("memmgrInsertFbRegion(", usable_mutation)
+    reserved_check_open = reserved_code.find(
+        "{", reserved_check + len("if (cmpStatus != NV_OK)")
+    )
+    if reserved_check_open < 0:
+        die("cannot locate reserved-region helper failure block")
+    reserved_check_close = find_matching_brace(reserved_code, reserved_check_open)
+    reserved_return = find_unconditional_top_level_statement(
+        reserved_text,
+        reserved_check_open,
+        reserved_check_close,
+        r"\breturn\s+cmpStatus\s*;",
+    )
+    if not (
+        0
+        <= count_refusal
+        < host_dereference
+        < reserved_call
+        < reserved_check
+        < reserved_check_open
+        < reserved_return
+        < reserved_check_close
+        < usable_mutation
+        < insertion
+    ):
+        die(
+            "reserved-region helper failure block must return cmpStatus "
+            "before accounting mutation and insertion"
+        )
+
+
+CAPACITY_HARNESS_PREFIX = r'''
+#include <stdint.h>
+#include <stdio.h>
+
+typedef uint8_t NvBool;
+typedef uint32_t NvU32;
+typedef uint64_t NvU64;
+typedef int NV_STATUS;
+
+#define NV_FALSE 0U
+#define NV_TRUE 1U
+#define NV_OK 0
+#define NV_ERR_INVALID_STATE 0x40
+#define CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM 6U
+'''
+
+
+CAPACITY_HARNESS_SUFFIX = r'''
+static unsigned int failures;
+
+static void expectStatus(const char *name, NV_STATUS actual, NV_STATUS expected)
+{
+    if (actual != expected)
+    {
+        fprintf(stderr, "%s: status 0x%x, expected 0x%x\n",
+                name, actual, expected);
+        failures++;
+    }
+}
+
+int main(void)
+{
+    expectStatus("preheap-ten-regions", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 10U, 16U, NV_FALSE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0ULL), NV_OK);
+    expectStatus("preheap-eleven-regions", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 11U, 16U, NV_FALSE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-zero-regions", _memmgrCmpValidatePreHeapRegionState(
+        0x2082U, 0U, 16U, NV_FALSE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-insufficient-capacity", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 1U, 6U, NV_FALSE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-virtual", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 5U, 16U, NV_TRUE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-NUMA", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 5U, 16U, NV_FALSE, NV_TRUE, NV_FALSE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-size-override", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 5U, 16U, NV_FALSE, NV_FALSE, NV_TRUE,
+        ~0ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-override-max", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 5U, 16U, NV_FALSE, NV_FALSE, NV_FALSE,
+        0x1234ULL, 0ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-override-init-min", _memmgrCmpValidatePreHeapRegionState(
+        0x20C2U, 5U, 16U, NV_FALSE, NV_FALSE, NV_FALSE,
+        ~0ULL, 0x1234ULL),
+        NV_ERR_INVALID_STATE);
+    expectStatus("preheap-non-target-bypass", _memmgrCmpValidatePreHeapRegionState(
+        0x1234U, 16U, 16U, NV_TRUE, NV_TRUE, NV_TRUE,
+        0ULL, 0x1234ULL), NV_OK);
+
+    expectStatus("reserved-exact-host", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 16U, 16U, 0x1000ULL, 0x2fffULL,
+        0x1000ULL, 0x2000ULL, 0x4000ULL, 1U), NV_OK);
+    expectStatus("reserved-one-slot-fits", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 15U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 1U), NV_OK);
+    expectStatus("reserved-one-slot-full", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 16U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-two-slots-fit", _memmgrCmpValidateReservedRegionInsertion(
+        0x2082U, 14U, 16U, 0x1000ULL, 0x3fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 1U), NV_OK);
+    expectStatus("reserved-two-slots-full", _memmgrCmpValidateReservedRegionInsertion(
+        0x2082U, 15U, 16U, 0x1000ULL, 0x3fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-base-below-host", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x1000ULL, 0x2fffULL,
+        0x0fffULL, 0x1000ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-end-beyond-host", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1001ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-addition-overflow", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0ULL, ~0ULL,
+        ~0ULL - 0xffULL, 0x200ULL, ~0ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-usable-underflow", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1000ULL, 0x0fffULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-no-parent", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 0U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-multiple-parents", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x1000ULL, 0x2fffULL,
+        0x2000ULL, 0x1000ULL, 0x4000ULL, 2U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-reversed-host", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 5U, 16U, 0x3000ULL, 0x2fffULL,
+        0x3000ULL, 1ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-zero-regions", _memmgrCmpValidateReservedRegionInsertion(
+        0x20C2U, 0U, 16U, 0x1000ULL, 0x2fffULL,
+        0x1000ULL, 0x2000ULL, 0x4000ULL, 1U), NV_ERR_INVALID_STATE);
+    expectStatus("reserved-non-target-bypass", _memmgrCmpValidateReservedRegionInsertion(
+        0x1234U, 16U, 16U, 0x2000ULL, 0x1000ULL,
+        ~0ULL, 0ULL, 0ULL, 0U), NV_OK);
+
+    if (failures != 0)
+    {
+        fprintf(stderr, "%u capacity self-test(s) failed\n", failures);
+        return 1;
+    }
+
+    puts("PMA capacity helpers: PASS (24 compiled vectors)");
+    return 0;
+}
+'''
+
+
+HARNESS_PREFIX = r'''
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef unsigned char NvBool;
+typedef unsigned int NvU32;
+typedef unsigned long long NvU64;
+typedef int NV_STATUS;
+
+#define NV_FALSE 0U
+#define NV_TRUE 1U
+#define NV_OK 0
+#define NV_ERR_INVALID_STATE 0x40
+#define NV_ERR_GENERIC 0x01
+#define LEVEL_ERROR 0
+#define MAX_FB_REGIONS 16U
+#define PMA_QUERY_NUMA_ONLINED 0x8U
+#define GSP_FW_WPR_META_MAGIC 0xdc3aae21371a60b3ULL
+#define GSP_FW_WPR_META_REVISION 1ULL
+#define NV_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define NV_MIN(a, b) ((a) < (b) ? (a) : (b))
+#define NV_ASSERT_OR_RETURN(condition, value) \
+    do { if (!(condition)) return (value); } while (0)
+
+typedef struct FB_REGION_DESCRIPTOR
+{
+    NvU64 base;
+    NvU64 limit;
+    NvU64 rsvdSize;
+    NvBool bRsvdRegion;
+    NvU32 performance;
+    NvBool bSupportCompressed;
+    NvBool bSupportISO;
+    NvBool bProtected;
+    NvBool bInternalHeap;
+    NvBool bLostOnSuspend;
+    NvBool bPreserveOnSuspend;
+    NvU32 regionTag;
+} FB_REGION_DESCRIPTOR;
+
+typedef struct GspFwWprMeta
+{
+    NvU64 magic;
+    NvU64 revision;
+    NvU64 gspFwRsvdStart;
+    NvU64 nonWprHeapOffset;
+    NvU64 nonWprHeapSize;
+    NvU64 gspFwWprStart;
+    NvU64 gspFwHeapOffset;
+    NvU64 gspFwHeapSize;
+    NvU64 gspFwWprEnd;
+    NvU64 fbSize;
+} GspFwWprMeta;
+
+typedef struct MEMORY_DESCRIPTOR
+{
+    NvU64 size;
+} MEMORY_DESCRIPTOR;
+
+typedef struct PMA_OBJECT
+{
+    NvU32 unused;
+} PMA_OBJECT;
+
+typedef struct Heap
+{
+    NvU64 base;
+    NvU64 total;
+    PMA_OBJECT *pPmaObject;
+} Heap;
+
+typedef struct MemoryManager MemoryManager;
+
+typedef struct KernelGsp
+{
+    GspFwWprMeta *pWprMeta;
+    MEMORY_DESCRIPTOR *pWprMetaDescriptor;
+} KernelGsp;
+
+typedef struct OBJGPU
+{
+    struct
+    {
+        NvU32 PCIDeviceID;
+    } idInfo;
+    KernelGsp *pKernelGsp;
+    MemoryManager *pMemoryManager;
+} OBJGPU;
+
+struct MemoryManager
+{
+    struct
+    {
+        NvU64 fbAddrSpaceSizeMb;
+        NvU32 numFBRegions;
+        FB_REGION_DESCRIPTOR fbRegion[MAX_FB_REGIONS];
+    } Ram;
+    Heap *pHeap;
+    OBJGPU *pGpu;
+};
+
+#define GPU_GET_KERNEL_GSP(pGpu) ((pGpu)->pKernelGsp)
+
+static NvU32 g_query_config;
+static NV_STATUS g_query_status;
+static NV_STATUS g_registration_status;
+static NvU64 g_pma_total;
+static NvU32 g_query_calls;
+static NvU32 g_registration_calls;
+static NvU32 g_total_calls;
+static NvU32 g_bad_pointer_calls;
+static OBJGPU *g_expected_gpu;
+static MemoryManager *g_expected_memory_manager;
+static Heap *g_expected_heap;
+static PMA_OBJECT *g_expected_pma;
+
+static void nv_printf(NvU32 level, const char *format, ...)
+{
+    va_list arguments;
+    (void)level;
+    va_start(arguments, format);
+    va_end(arguments);
+}
+
+#define NV_PRINTF nv_printf
+
+static NvU64 memdescGetSize(const MEMORY_DESCRIPTOR *pDescriptor)
+{
+    return pDescriptor->size;
+}
+
+static NV_STATUS pmaQueryConfigs(PMA_OBJECT *pPmaObject, NvU32 *pConfig)
+{
+    g_query_calls++;
+    if (pPmaObject != g_expected_pma || pConfig == NULL)
+    {
+        g_bad_pointer_calls++;
+        return NV_ERR_GENERIC;
+    }
+    if (g_query_status != NV_OK)
+        return g_query_status;
+    *pConfig &= g_query_config;
+    return NV_OK;
+}
+
+static NV_STATUS memmgrPmaRegisterRegions(
+    OBJGPU *pGpu,
+    MemoryManager *pMemoryManager,
+    Heap *pHeap,
+    PMA_OBJECT *pPmaObject)
+{
+    g_registration_calls++;
+    if (pGpu != g_expected_gpu ||
+        pMemoryManager != g_expected_memory_manager ||
+        pHeap != g_expected_heap ||
+        pPmaObject != g_expected_pma)
+    {
+        g_bad_pointer_calls++;
+        return NV_ERR_GENERIC;
+    }
+    return g_registration_status;
+}
+
+static void pmaGetTotalMemory(PMA_OBJECT *pPmaObject, NvU64 *pTotal)
+{
+    g_total_calls++;
+    if (pPmaObject != g_expected_pma || pTotal == NULL)
+    {
+        g_bad_pointer_calls++;
+        return;
+    }
+    *pTotal = g_pma_total;
+}
+
+static NV_STATUS runExtractedGuard(MemoryManager *pMemoryManager)
+{
+    OBJGPU *pGpu = pMemoryManager->pGpu;
+    NV_STATUS status = NV_OK;
+'''
+
+
+HARNESS_SUFFIX = r'''
+    return status;
+}
+
+#define FB64 0x0000001000000000ULL
+#define FB40 0x0000000a00000000ULL
+#define LIVE_PROTECTED 0x0000000ff7200000ULL
+#define LIVE_PUBLIC 0x0000000fd8e50000ULL
+
+typedef struct TestContext
+{
+    OBJGPU gpu;
+    KernelGsp kernelGsp;
+    GspFwWprMeta meta;
+    MEMORY_DESCRIPTOR descriptor;
+    PMA_OBJECT pma;
+    Heap heap;
+    MemoryManager memoryManager;
+} TestContext;
+
+static NvU32 failures;
+
+static NvU64 regionSize(const FB_REGION_DESCRIPTOR *pRegion)
+{
+    return pRegion->limit - pRegion->base + 1ULL;
+}
+
+static void addRegion(
+    TestContext *pContext,
+    NvU64 base,
+    NvU64 limit,
+    NvBool reserved,
+    NvBool internal,
+    NvBool protectedRegion,
+    NvU64 reservedSize)
+{
+    NvU32 index = pContext->memoryManager.Ram.numFBRegions++;
+    FB_REGION_DESCRIPTOR *pRegion = &pContext->memoryManager.Ram.fbRegion[index];
+    pRegion->base = base;
+    pRegion->limit = limit;
+    pRegion->bRsvdRegion = reserved;
+    pRegion->bInternalHeap = internal;
+    pRegion->bProtected = protectedRegion;
+    pRegion->rsvdSize = reservedSize;
+}
+
+static void resetStubs(NvU64 pmaTotal)
+{
+    g_query_config = 0;
+    g_query_status = NV_OK;
+    g_registration_status = NV_OK;
+    g_pma_total = pmaTotal;
+    g_query_calls = 0;
+    g_registration_calls = 0;
+    g_total_calls = 0;
+    g_bad_pointer_calls = 0;
+}
+
+static void initCommon(
+    TestContext *pContext,
+    NvU32 deviceId,
+    NvU64 fbSize,
+    NvU64 protectedStart)
+{
+    memset(pContext, 0, sizeof(*pContext));
+    pContext->gpu.idInfo.PCIDeviceID = deviceId << 16;
+    pContext->gpu.pKernelGsp = &pContext->kernelGsp;
+    pContext->gpu.pMemoryManager = &pContext->memoryManager;
+    pContext->kernelGsp.pWprMeta = &pContext->meta;
+    pContext->kernelGsp.pWprMetaDescriptor = &pContext->descriptor;
+    pContext->descriptor.size = sizeof(pContext->meta);
+    pContext->heap.pPmaObject = &pContext->pma;
+    pContext->heap.total = fbSize;
+    pContext->memoryManager.pHeap = &pContext->heap;
+    pContext->memoryManager.pGpu = &pContext->gpu;
+    pContext->memoryManager.Ram.fbAddrSpaceSizeMb = fbSize >> 20;
+    g_expected_gpu = &pContext->gpu;
+    g_expected_memory_manager = &pContext->memoryManager;
+    g_expected_heap = &pContext->heap;
+    g_expected_pma = &pContext->pma;
+
+    pContext->meta.magic = GSP_FW_WPR_META_MAGIC;
+    pContext->meta.revision = GSP_FW_WPR_META_REVISION;
+    pContext->meta.fbSize = fbSize;
+    pContext->meta.gspFwRsvdStart = protectedStart;
+    pContext->meta.nonWprHeapOffset = protectedStart;
+    pContext->meta.gspFwWprStart = protectedStart + 0x100000ULL;
+    pContext->meta.nonWprHeapSize = 0x100000ULL;
+    pContext->meta.gspFwHeapOffset = protectedStart + 0x200000ULL;
+    pContext->meta.gspFwHeapSize = 0x6e00000ULL;
+    pContext->meta.gspFwWprEnd = fbSize - 0x100000ULL;
+}
+
+static void initLive20c2(TestContext *pContext)
+{
+    initCommon(pContext, 0x20c2U, FB64, LIVE_PROTECTED);
+    addRegion(pContext, 0x0000000000000000ULL, 0x000000001007ffffULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, 0x10080000ULL);
+    addRegion(pContext, 0x0000000010080000ULL, 0x0000000fe8ecffffULL,
+              NV_FALSE, NV_FALSE, NV_FALSE, 0);
+    addRegion(pContext, 0x0000000fe8ed0000ULL, 0x0000000ff41dffffULL,
+              NV_FALSE, NV_TRUE, NV_FALSE, 0x0b310000ULL);
+    addRegion(pContext, 0x0000000ff41e0000ULL, 0x0000000ff420ffffULL,
+              NV_TRUE, NV_TRUE, NV_FALSE, 0x00030000ULL);
+    addRegion(pContext, 0x0000000ff4210000ULL, 0x0000000ff710ffffULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, 0x02f00000ULL);
+    addRegion(pContext, 0x0000000ff7110000ULL, 0x0000000ff71fffffULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, 0x000f0000ULL);
+    addRegion(pContext, LIVE_PROTECTED, FB64 - 1ULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, FB64 - LIVE_PROTECTED);
+    resetStubs(LIVE_PUBLIC);
+}
+
+static void initSynthetic2082(TestContext *pContext)
+{
+    const NvU64 protectedStart = FB40 - 0x08e00000ULL;
+    const NvU64 publicBase = 0x10080000ULL;
+    initCommon(pContext, 0x2082U, FB40, protectedStart);
+    addRegion(pContext, 0, publicBase - 1ULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, publicBase);
+    addRegion(pContext, publicBase, protectedStart - 1ULL,
+              NV_FALSE, NV_FALSE, NV_FALSE, 0);
+    addRegion(pContext, protectedStart, FB40 - 1ULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, FB40 - protectedStart);
+    resetStubs(protectedStart - publicBase);
+}
+
+static void expectResult(
+    const char *name,
+    TestContext *pContext,
+    NV_STATUS expected,
+    NvU32 expectedQueries,
+    NvU32 expectedRegistrations,
+    NvU32 expectedTotalQueries)
+{
+    TestContext before = *pContext;
+    NV_STATUS actual = runExtractedGuard(&pContext->memoryManager);
+    if (actual != expected)
+    {
+        fprintf(stderr, "%s: status 0x%x, expected 0x%x\n", name, actual, expected);
+        failures++;
+    }
+    if (g_query_calls != expectedQueries ||
+        g_registration_calls != expectedRegistrations ||
+        g_total_calls != expectedTotalQueries ||
+        g_bad_pointer_calls != 0)
+    {
+        fprintf(stderr,
+                "%s: query/registration/total/bad-pointer calls "
+                "%u/%u/%u/%u, expected %u/%u/%u/0\n",
+                name, g_query_calls, g_registration_calls, g_total_calls,
+                g_bad_pointer_calls, expectedQueries, expectedRegistrations,
+                expectedTotalQueries);
+        failures++;
+    }
+    if (memcmp(&before, pContext, sizeof(before)) != 0)
+    {
+        fprintf(stderr, "%s: extracted guard mutated its input layout\n", name);
+        failures++;
+    }
+}
+
+static void expectPass(const char *name, TestContext *pContext)
+{
+    expectResult(name, pContext, NV_OK, 1, 1, 1);
+}
+
+static void expectGuardRefusal(const char *name, TestContext *pContext)
+{
+    expectResult(name, pContext, NV_ERR_INVALID_STATE, 1, 0, 0);
+}
+
+static void expectEarlyRefusal(const char *name, TestContext *pContext)
+{
+    expectResult(name, pContext, NV_ERR_INVALID_STATE, 0, 0, 0);
+}
+
+int main(void)
+{
+    TestContext context;
+    FB_REGION_DESCRIPTOR *pRegion;
+    NvU64 clippedPublic;
+
+    initLive20c2(&context);
+    expectPass("live-20c2-seven-region-map", &context);
+
+    initSynthetic2082(&context);
+    expectPass("synthetic-2082-map", &context);
+
+    initLive20c2(&context);
+    context.heap.base = 0x20000000ULL;
+    context.heap.total = FB64 - context.heap.base;
+    clippedPublic = 0x0000000fe8ed0000ULL - context.heap.base;
+    resetStubs(clippedPublic);
+    expectPass("heap-clipping-exact-PMA-total", &context);
+
+    initLive20c2(&context);
+    context.heap.base = 0x20000000ULL;
+    context.heap.total = FB64 - context.heap.base;
+    resetStubs(LIVE_PUBLIC);
+    expectResult("heap-clipping-PMA-mismatch", &context,
+                 NV_ERR_INVALID_STATE, 1, 1, 1);
+
+    initLive20c2(&context);
+    pRegion = &context.memoryManager.Ram.fbRegion[6];
+    pRegion->limit = LIVE_PROTECTED + 0xffffULL;
+    pRegion->rsvdSize = regionSize(pRegion);
+    addRegion(&context, pRegion->limit + 1ULL, FB64 - 1ULL,
+              NV_TRUE, NV_FALSE, NV_FALSE, FB64 - pRegion->limit - 1ULL);
+    expectGuardRefusal("top-carveout-must-be-one-exact-region", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.fbRegion[1].base += 0x10000ULL;
+    expectGuardRefusal("region-gap", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.fbRegion[1].base -= 0x10000ULL;
+    expectGuardRefusal("region-overlap", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.fbRegion[1].base += 1ULL;
+    expectGuardRefusal("region-misalignment", &context);
+
+    initLive20c2(&context);
+    pRegion = &context.memoryManager.Ram.fbRegion[2];
+    pRegion->rsvdSize = regionSize(pRegion) + 1ULL;
+    expectGuardRefusal("reserved-size-overflow", &context);
+
+    initLive20c2(&context);
+    pRegion = &context.memoryManager.Ram.fbRegion[0];
+    pRegion->rsvdSize = regionSize(pRegion) - 0x10000ULL;
+    expectGuardRefusal("reserved-region-must-be-full", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.fbRegion[1].rsvdSize = 0x10000ULL;
+    expectGuardRefusal("public-region-reserved-bytes", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.fbRegion[1].bProtected = NV_TRUE;
+    expectGuardRefusal("public-region-protected", &context);
+
+    initLive20c2(&context);
+    pRegion = &context.memoryManager.Ram.fbRegion[6];
+    pRegion->bRsvdRegion = NV_FALSE;
+    pRegion->bInternalHeap = NV_TRUE;
+    pRegion->rsvdSize = 0;
+    expectGuardRefusal("internal-region-crosses-protected-start", &context);
+
+    initLive20c2(&context);
+    g_query_config = PMA_QUERY_NUMA_ONLINED;
+    expectGuardRefusal("NUMA-onlined-refusal", &context);
+
+    initLive20c2(&context);
+    pRegion = &context.memoryManager.Ram.fbRegion[0];
+    pRegion->limit = 0xbfffffffULL;
+    pRegion->rsvdSize = regionSize(pRegion);
+    context.memoryManager.Ram.fbRegion[1].base = 0xc0000000ULL;
+    expectGuardRefusal("native-public-capacity-floor", &context);
+
+    initLive20c2(&context);
+    g_pma_total = LIVE_PUBLIC - 0x10000ULL;
+    expectResult("post-registration-PMA-total-mismatch", &context,
+                 NV_ERR_INVALID_STATE, 1, 1, 1);
+
+    initLive20c2(&context);
+    context.gpu.pKernelGsp = NULL;
+    expectEarlyRefusal("missing-KernelGsp", &context);
+
+    initLive20c2(&context);
+    context.kernelGsp.pWprMeta = NULL;
+    expectEarlyRefusal("missing-WPR-metadata", &context);
+
+    initLive20c2(&context);
+    context.kernelGsp.pWprMetaDescriptor = NULL;
+    expectEarlyRefusal("missing-WPR-metadata-descriptor", &context);
+
+    initLive20c2(&context);
+    context.descriptor.size = sizeof(context.meta) - 1ULL;
+    expectEarlyRefusal("truncated-WPR-metadata-descriptor", &context);
+
+    initLive20c2(&context);
+    context.meta.magic ^= 1ULL;
+    expectEarlyRefusal("WPR-metadata-magic-mismatch", &context);
+
+    initLive20c2(&context);
+    context.meta.revision++;
+    expectEarlyRefusal("WPR-metadata-revision-mismatch", &context);
+
+    initLive20c2(&context);
+    context.memoryManager.Ram.numFBRegions = MAX_FB_REGIONS + 1U;
+    expectGuardRefusal("region-count-exceeds-capacity", &context);
+
+    initLive20c2(&context);
+    context.meta.gspFwRsvdStart += 0x10000ULL;
+    expectEarlyRefusal("reserved-start-must-equal-non-WPR-offset", &context);
+
+    initLive20c2(&context);
+    context.meta.nonWprHeapSize += 0x10000ULL;
+    expectEarlyRefusal("non-WPR-span-must-end-at-WPR-start", &context);
+
+    initLive20c2(&context);
+    context.meta.gspFwHeapOffset = context.meta.gspFwWprEnd;
+    expectEarlyRefusal("GSP-heap-must-stay-inside-WPR", &context);
+
+    initLive20c2(&context);
+    g_query_status = NV_ERR_GENERIC;
+    expectGuardRefusal("PMA-config-query-failure", &context);
+
+    initLive20c2(&context);
+    g_registration_status = NV_ERR_GENERIC;
+    expectResult("standard-PMA-registration-failure", &context,
+                 NV_ERR_GENERIC, 1, 1, 0);
+
+    initLive20c2(&context);
+    context.gpu.idInfo.PCIDeviceID = 0x1234U << 16;
+    context.gpu.pKernelGsp = NULL;
+    expectResult("non-target-device-bypasses-target-guard", &context,
+                 NV_OK, 0, 1, 0);
+
+    if (failures != 0)
+    {
+        fprintf(stderr, "%u PMA-guard self-test(s) failed\n", failures);
+        return 1;
+    }
+
+    puts("PMA-guard self-test: PASS (29 compiled vectors)");
+    return 0;
+}
+'''
+
+
+def compiler_command() -> list[str]:
+    configured = os.environ.get("HOSTCC") or os.environ.get("CC") or "cc"
+    command = shlex.split(configured)
+    if not command:
+        die("empty HOSTCC/CC command")
+    if shutil.which(command[0]) is None:
+        die(f"host C compiler not found: {command[0]}")
+    return command
+
+
+def compile_and_run(harness: str, stem: str, temp_dir: Path) -> str:
+    harness_path = temp_dir / f"{stem}.c"
+    executable = temp_dir / stem
+    harness_path.write_text(harness, encoding="utf-8")
+
+    compile_result = subprocess.run(
+        compiler_command()
+        + [
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-O2",
+            str(harness_path),
+            "-o",
+            str(executable),
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=temp_dir,
+    )
+    if compile_result.returncode != 0:
+        details = (compile_result.stdout + compile_result.stderr).strip()
+        die(f"host compilation failed for {stem}:\n{details}")
+
+    test_result = subprocess.run(
+        [str(executable)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=temp_dir,
+    )
+    output = (test_result.stdout + test_result.stderr).strip()
+    if test_result.returncode != 0:
+        die(f"compiled C vectors failed for {stem}:\n{output}")
+    return output
+
+
+def run_tests(source: Path) -> None:
+    reserved_source = source.parent / "arch" / "maxwell" / "mem_mgr_gm107.c"
+    try:
+        source_before = source.read_bytes()
+        text = source_before.decode("utf-8")
+        reserved_before = reserved_source.read_bytes()
+        reserved_text = reserved_before.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        die(f"cannot read materialized memory-manager sources: {error}")
+
+    try:
+        function = extract_function(text, FUNCTION_NAME)
+        segment = extract_guard_segment(function)
+        preheap_helper = extract_function(text, PREHEAP_HELPER)
+        reserved_helper = extract_function(reserved_text, RESERVED_INSERT_HELPER)
+        if "#define CMPUNLOCKER_PMA_FB_REGION_SETUP_HEADROOM 6U" not in text:
+            die("missing exact pre-heap headroom definition")
+        validate_source_shape(function, segment, preheap_helper, reserved_text)
+
+        with tempfile.TemporaryDirectory(prefix="cmpunlocker-pma-guard-test.") as temp:
+            temp_dir = Path(temp)
+            capacity_harness = (
+                CAPACITY_HARNESS_PREFIX
+                + "\n"
+                + preheap_helper
+                + "\n\n"
+                + reserved_helper
+                + "\n"
+                + CAPACITY_HARNESS_SUFFIX
+            )
+            capacity_output = compile_and_run(
+                capacity_harness, "pma-capacity-test", temp_dir
+            )
+            guard_harness = HARNESS_PREFIX + "\n" + segment + "\n" + HARNESS_SUFFIX
+            guard_output = compile_and_run(
+                guard_harness, "pma-guard-test", temp_dir
+            )
+            print(f"{source}: {capacity_output}; {guard_output}")
+    finally:
+        try:
+            source_after = source.read_bytes()
+            reserved_after = reserved_source.read_bytes()
+        except OSError as error:
+            die(f"cannot re-read sources after testing: {error}")
+        if source_after != source_before:
+            die(f"source changed while running self-test: {source}")
+        if reserved_after != reserved_before:
+            die(f"source changed while running self-test: {reserved_source}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compile and test the extracted final materialized FB/PMA guard "
+            "from patched mem_mgr.c"
+        )
+    )
+    parser.add_argument(
+        "source",
+        type=Path,
+        nargs="+",
+        help="one or more final patched mem_mgr.c sources",
+    )
+    args = parser.parse_args()
+    for source in args.source:
+        run_tests(source.resolve())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

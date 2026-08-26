@@ -38,6 +38,43 @@ is_stock_memory() {
     return 1
 }
 
+smi_index_for_bus() {
+    local want="$1"
+    local line index bus
+
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        index="$(echo "${line}" | cut -d, -f1 | tr -d '[:space:]')"
+        bus="$(normalize_bus_id "$(echo "${line}" | cut -d, -f2)")"
+        if [[ "${index}" =~ ^[0-9]+$ && "${bus}" == "${want}" ]]; then
+            echo "${index}"
+            return 0
+        fi
+    done <<< "${SMI_INDEX_CACHE:-}"
+    return 1
+}
+
+runtime_hazards_for_gpu() {
+    local bdf="$1"
+    local gpu_index="$2"
+    local log_text="$3"
+    local xid_bdf="${bdf%.*}"
+
+    {
+        # Xid messages use the PCI address without the function suffix. Match
+        # the complete prefix so a Booter status such as 0x31 cannot be
+        # mistaken for Xid 31.
+        printf '%s\n' "${log_text}" | \
+            grep -F "NVRM: Xid (PCI:${xid_bdf}):" || true
+
+        # Fault and scrub diagnostics use the NVIDIA GPU index, so only this
+        # GPU is matched. A region violation is unsafe for any access type.
+        printf '%s\n' "${log_text}" | \
+            grep -F "NVRM: GPU${gpu_index} " | \
+            grep -E 'FAULT_INFO_TYPE_REGION_VIOLATION|_scrubWaitAndSave: Timed out when waiting for scrub jobs to finish\.' || true
+    } | awk '!seen[$0]++'
+}
+
 banner
 step_init 3
 
@@ -45,6 +82,8 @@ step "Locating GPU inventory"
 command -v nvidia-smi &>/dev/null || die "nvidia-smi not found"
 SMI_MEM_CACHE="$(nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
 [[ -n "${SMI_MEM_CACHE}" ]] || die "nvidia-smi returned no GPU memory data"
+SMI_INDEX_CACHE="$(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits 2>/dev/null || true)"
+[[ -n "${SMI_INDEX_CACHE}" ]] || die "nvidia-smi returned no GPU index data"
 
 GPU_BDFS=()
 GPU_DEVIDS=()
@@ -114,13 +153,61 @@ for i in "${!GPU_BDFS[@]}"; do
 done
 
 step "Checking unlock logs and installed profile"
-sec2_logs="$(dmesg 2>/dev/null | grep 'SEC2_DEBUG' || true)"
-if [[ -n "${sec2_logs}" ]]; then
-    ok "dmesg contains SEC2_DEBUG unlock logs"
-    info "Sample:"
-    printf '%s\n' "${sec2_logs}" | tail -n 8 | sed 's/^/  /'
+kernel_log="$(dmesg 2>/dev/null || true)"
+if [[ -z "${kernel_log}" ]]; then
+    err "Cannot read the current boot kernel log; memory safety cannot be proven"
+    failures=$((failures + 1))
 else
-    warn "No SEC2_DEBUG lines in dmesg (logs may have rotated; unlock can still be OK if memory is unlocked)"
+    for i in "${!GPU_BDFS[@]}"; do
+        bdf="${GPU_BDFS[$i]}"
+        gpu_index="$(smi_index_for_bus "${bdf}" || true)"
+        if [[ -z "${gpu_index}" ]]; then
+            err "${bdf}: cannot map PCI device to an NVIDIA GPU index"
+            failures=$((failures + 1))
+            continue
+        fi
+
+        gpu_logs="$(printf '%s\n' "${kernel_log}" | grep -F "NVRM: GPU${gpu_index} " || true)"
+        layout_logs="$(printf '%s\n' "${gpu_logs}" | grep -F 'SEC2_DEBUG_FB_LAYOUT:' || true)"
+        pma_logs="$(printf '%s\n' "${gpu_logs}" | grep -F 'SEC2_DEBUG_PMA_GUARD:' || true)"
+        safe_layout_logs="$(printf '%s\n' "${layout_logs}" | \
+            grep -F 'SEC2_DEBUG_FB_LAYOUT: validated' | \
+            grep -F 'status=safe build=cmpunlocker-safety-v4' || true)"
+        unsafe_pma_logs="$(grep -Fv 'status=safe build=cmpunlocker-safety-v4' \
+            <<< "${pma_logs}" || true)"
+
+        if [[ -z "${safe_layout_logs}" ]]; then
+            err "${bdf}: missing the required safe native framebuffer-layout proof"
+            failures=$((failures + 1))
+        elif grep -Fq 'SEC2_DEBUG_FB_LAYOUT: rejected' <<< "${layout_logs}"; then
+            err "${bdf}: the current boot contains a rejected framebuffer layout"
+            failures=$((failures + 1))
+        else
+            ok "${bdf}: native framebuffer layout is safe"
+        fi
+
+        if ! grep -Fq 'status=safe build=cmpunlocker-safety-v4' <<< "${pma_logs}"; then
+            err "${bdf}: missing the required safe physical-memory-allocator proof"
+            failures=$((failures + 1))
+        elif [[ -n "${unsafe_pma_logs}" ]]; then
+            err "${bdf}: the current boot contains an unsafe allocator diagnostic"
+            failures=$((failures + 1))
+        else
+            ok "${bdf}: physical memory allocator matches the validated public range"
+        fi
+
+        runtime_hazards="$(runtime_hazards_for_gpu \
+            "${bdf}" "${gpu_index}" "${kernel_log}")"
+        if [[ -n "${runtime_hazards}" ]]; then
+            err "${bdf}: the current boot contains an NVIDIA Xid, framebuffer region violation, or scrub timeout"
+            while IFS= read -r hazard; do
+                [[ -n "${hazard}" ]] && warn "${hazard}"
+            done <<< "${runtime_hazards}"
+            failures=$((failures + 1))
+        else
+            ok "${bdf}: no matching runtime memory fault in the current boot"
+        fi
+    done
 fi
 
 echo ""
@@ -130,11 +217,11 @@ fi
 
 if (( failures > 0 )); then
     echo ""
-    die "${failures} GPU(s) failed unlock verification. Cold reboot if modules were just installed."
+    die "${failures} unlock or memory-safety verification check(s) failed"
 fi
 
 echo ""
-ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory"
+ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory with safe allocator proofs"
 
 if [[ -x "${SCRIPT_DIR}/tools/service.sh" ]]; then
     echo ""
