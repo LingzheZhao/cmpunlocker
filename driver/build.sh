@@ -35,13 +35,56 @@ version_supported() {
     return 1
 }
 
+cc_supports_auto_var_init() {
+    local cc="$1"
+    echo 'int x;' | "${cc}" -ftrivial-auto-var-init=zero -x c -c -o /dev/null - >/dev/null 2>&1
+}
+
+kernel_needs_auto_var_init() {
+    local config
+    for config in \
+        "${KSRC}/include/config/auto.conf" \
+        "${KSRC}/.config" \
+        "/boot/config-${KVER}"; do
+        [[ -r "${config}" ]] || continue
+        grep -q '^CONFIG_INIT_STACK_ALL_ZERO=y' "${config}" && return 0
+        return 1
+    done
+    return 1
+}
+
+select_kernel_cc() {
+    local cand
+    if [[ -n "${CMPUNLOCKER_CC:-}" ]]; then
+        command -v "${CMPUNLOCKER_CC}" &>/dev/null || \
+            die "CMPUNLOCKER_CC='${CMPUNLOCKER_CC}' not found"
+        if kernel_needs_auto_var_init && ! cc_supports_auto_var_init "${CMPUNLOCKER_CC}"; then
+            die "CMPUNLOCKER_CC='${CMPUNLOCKER_CC}' does not support -ftrivial-auto-var-init=zero required by kernel ${KVER}"
+        fi
+        KERNEL_CC="${CMPUNLOCKER_CC}"
+        return
+    fi
+    if kernel_needs_auto_var_init; then
+        for cand in gcc-14 gcc-13 gcc-12 gcc; do
+            command -v "${cand}" &>/dev/null || continue
+            cc_supports_auto_var_init "${cand}" || continue
+            KERNEL_CC="${cand}"
+            return
+        done
+        die "Kernel ${KVER} requires GCC 12+ (-ftrivial-auto-var-init=zero). Install gcc-12 or set CMPUNLOCKER_CC"
+    fi
+    command -v gcc &>/dev/null || die "gcc is required to build modules and run safety checks"
+    KERNEL_CC=gcc
+}
+
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
 version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (supported: ${SUPPORTED_VERSIONS[*]})"
 [[ -d "${PATCH_DIR}" ]] || die "Missing patches directory: ${PATCH_DIR}"
 [[ -d "${KSRC}" ]] || die "Kernel headers not found at ${KSRC}. Install linux-headers-${KVER} (or kernel-devel)."
 command -v python3 &>/dev/null || die "python3 is required to apply the card memory profile"
-command -v gcc &>/dev/null || die "gcc is required to build modules and run safety checks"
+select_kernel_cc
+info "Using ${KERNEL_CC} to build modules for kernel ${KVER}"
 info "Building against open-gpu-kernel-modules ${VERSION}"
 
 PATCH_ORDER=(
@@ -201,10 +244,10 @@ PMA_GUARD_TEST="${SCRIPT_DIR}/../tools/test-pma-guard.py"
     die "Missing FB-region validator self-test: ${FB_REGION_VALIDATOR_TEST}"
 [[ -f "${PMA_GUARD_TEST}" ]] || \
     die "Missing materialized FB/PMA guard self-test: ${PMA_GUARD_TEST}"
-HOSTCC=gcc python3 "${FB_REGION_VALIDATOR_TEST}" "${GSP_C}" || \
+HOSTCC="${KERNEL_CC}" python3 "${FB_REGION_VALIDATOR_TEST}" "${GSP_C}" || \
     die "Native FB-region validator source/semantic self-test failed"
 ok "Native FB-region validator passed compiled boundary-value tests"
-HOSTCC=gcc python3 "${PMA_GUARD_TEST}" "${MEM_MGR_C}" || \
+HOSTCC="${KERNEL_CC}" python3 "${PMA_GUARD_TEST}" "${MEM_MGR_C}" || \
     die "Materialized FB/PMA guard source/semantic self-test failed"
 ok "Materialized FB/PMA guard passed compiled fail-closed tests"
 
@@ -765,9 +808,9 @@ find . -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
 rm -rf src/nvidia/_out src/nvidia-modeset/_out kernel-open/conftest 2>/dev/null || true
 
 JOBS="$(nproc)"
-CC_CMD="gcc"
+CC_CMD="${KERNEL_CC}"
 if command -v ccache &>/dev/null; then
-    CC_CMD="ccache gcc"
+    CC_CMD="ccache ${KERNEL_CC}"
     info "ccache detected — compiler output will be cached for faster rebuilds"
 fi
 make -j"${JOBS}" modules SYSSRC="${KSRC}" CC="${CC_CMD}"
