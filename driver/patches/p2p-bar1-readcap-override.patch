@@ -7,7 +7,7 @@
 +    //
 +    // cmpunlocker P2P: the read cap above is granted only for a common PCIe
 +    // switch, Ryzen, or Xeon-SPR. clFindCommonDownstreamBR() often fails to
-+    // identify the PLX switches these cards sit behind, so restore the cap for
++    // identify the downstream switch these cards sit behind, so restore the cap for
 +    // CMP device IDs. This does not invent a path the silicon lacks; it only
 +    // undoes a conservative host whitelist. Re-verify with a real peer copy on
 +    // a new topology rather than trusting nvidia-smi advertisement.

@@ -10,22 +10,11 @@ a multiple of its alignment leaves a gap before the next one. That gap is
 never budgeted, and the resulting window can be too small to place all the
 children even though the arithmetic says it fits.
 
-Seen on a Supermicro SYS-4028GR-TRT2 with four NVIDIA CMP 170HX behind one
-PLX switch, each with a 64GB BAR1 (64GB alignment) plus a 32MB BAR3, so each
-downstream port window is 64GB+32MB with 64GB alignment:
-
-  before: root port window 256GB + 128MB (exactly the sum of the children)
-          GPU0 BAR1 @ 0x21000000000, GPU1 @ 0x23000000000 (128GB apart)
-          GPU2, GPU3: BAR1 unassigned
-
-  after:  root port window 512GB
-          BAR1 @ 0x20000000000 / 0x22000000000 / 0x24000000000 / 0x26000000000
-          all four assigned
-
-Because each 64GB+32MB child must begin on a 64GB boundary it really occupies
-128GB, so four need 512GB while only 256GB was reserved. Two GPUs got a BAR1
-and two silently got none. The host bridge had 2TB free, so this was purely a
-sizing miscalculation, not address space exhaustion.
+Example: four GPUs each with a 64GB BAR1 (64GB alignment) plus a 32MB BAR3,
+so each downstream port window is 64GB+32MB with 64GB alignment. Summing
+sizes without padding reserved 256GB; with alignment each child occupies
+128GB and four need 512GB. Two GPUs can silently get no BAR1 even though
+the host bridge still has free MMIO.
 
 Using ALIGN() instead of max() budgets the inter-child padding. The two are
 identical whenever r_size <= align, which covers every ordinary device BAR

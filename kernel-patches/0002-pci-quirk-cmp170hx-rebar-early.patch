@@ -25,8 +25,8 @@ write is silently discarded, so it is enabled for the duration and restored
 afterwards. All-ones is treated as "window not responding" and the BAR is left
 at its stock size rather than programmed blindly.
 
-Result on the machine above: all four GPUs come up with a 64GB BAR1 from a
-cold boot, with no kexec or userspace register poking.
+With this quirk and the companion pbus_size_mem() fix, a cold boot can
+bring BAR1 up at 64GB without kexec or userspace register poking.
 
 --- a/drivers/pci/quirks.c	2026-07-17 12:24:12.000000000 -0700
 +++ b/drivers/pci/quirks.c	2026-08-07 20:12:19.858150756 -0700

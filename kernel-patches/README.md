@@ -11,11 +11,9 @@ pass `RMForceStaticBar1` / `RMPcieP2PType` through `NVreg_RegistryDwords` —
 GSP 610.43.02 rejects those keys. Without these kernel patches, some GPUs
 silently keep a 64MB BAR1 and BAR1 P2P cannot cover framebuffer.
 
-Brought up in [bayley/cmpunlocker](https://github.com/bayley/cmpunlocker)
-against `linux-source-7.0.0` (Ubuntu 26.04, release `7.0.12-cmp`) on a
-Supermicro SYS-4028GR-TRT2. Originally four CMP 170HX behind a single PLX
-switch, later **eight** across two switches on the same CPU root complex —
-neither patch needed changing.
+Sourced from [bayley/cmpunlocker](https://github.com/bayley/cmpunlocker). The
+hunks were written against Linux 7.0; they may need a one-line context tweak
+on other series. Keep the distro kernel installed as a GRUB fallback.
 
 ## 0001 — `pbus_size_mem()`: size bridge windows for child alignment padding
 
@@ -31,30 +29,15 @@ multiple of its alignment leaves a gap before the next one, and that gap is neve
 budgeted. The window then comes out too small to place all the children even
 though the arithmetic says it fits.
 
-With four GPUs each needing a 64GB BAR1 (64GB alignment) plus a 32MB BAR3, each
-downstream port window is 64GB+32MB and must begin on a 64GB boundary, so it
-really occupies 128GB:
+Example: four GPUs each needing a 64GB BAR1 (64GB alignment) plus a 32MB BAR3.
+Each downstream port window is 64GB+32MB and must begin on a 64GB boundary, so
+it really occupies 128GB. Four such children need 512GB; summing sizes without
+padding only reserved 256GB, and two GPUs silently got no BAR1.
 
-```
-before:  root port window 256GB + 128MB   (exactly the sum of the children)
-         BAR1 @ 0x21000000000, 0x23000000000   (128GB apart)
-         two GPUs got no BAR1 at all, silently
-
-after:   root port window 512GB
-         BAR1 @ 0x20000000000 / 0x22000000000 / 0x24000000000 / 0x26000000000
-```
-
-With eight GPUs the same arithmetic repeats per root port — 512GB behind each of
-the two switches, 1TB of prefetchable space in total:
-
-```
-00:02.0  BAR1 @ 0x20000000000 0x22000000000 0x24000000000 0x26000000000
-00:03.0  BAR1 @ 0x28000000000 0x2a000000000 0x2c000000000 0x2e000000000
-```
-
-That needs `pci=hpmmioprefsize=2T` and a BIOS MMIO-high window to match. The
-failure mode without patch 0001 is silent — enumeration reports success and some
-GPUs simply have no Region 1 — so check all of them, not just the first:
+The same padding repeats per root port. Size the BIOS MMIO-high window (and
+`pci=hpmmioprefsize`) for the whole span. The failure mode without this patch
+is silent — enumeration reports success and some GPUs simply have no Region 1 —
+so check all of them, not just the first:
 
 ```bash
 for d in $(lspci -D -d 10de: -n | awk '{print $1}'); do
@@ -66,7 +49,7 @@ done
 `r_size <= align`, which covers every ordinary device BAR (size == alignment), so
 only the mis-sized bridge windows change.
 
-This is a generic bug, not a CMP one — it just needs unusually large,
+This is a generic PCI bug, not a CMP one — it just needs unusually large,
 unusually aligned BARs to become visible.
 
 ## 0002 — `pci_fixup_early` quirk: program BAR1 REBAR to 64GB before enumeration
@@ -94,15 +77,19 @@ BAR.
 
 ## Building
 
+Use kernel source that matches the series you actually boot (`uname -r`), not
+an arbitrary distro `linux-source` metapackage. Apply both patches, keep the
+stock kernel as a GRUB fallback via `LOCALVERSION=-cmp`, and pin whatever
+packages your distro uses to install that series so an upgrade does not
+silently drop the patches.
+
 ```bash
-sudo apt install linux-source-7.0.0 bison flex libssl-dev libelf-dev dwarves gawk
-tar -xf /usr/src/linux-source-7.0.0/linux-source-7.0.0.tar.bz2 -C ~/
-cd ~/linux-source-7.0.0
+# Debian/Ubuntu example: source for the running series, then:
 patch -p1 < /path/to/kernel-patches/0001-*.patch
 patch -p1 < /path/to/kernel-patches/0002-*.patch
 
 cp /boot/config-"$(uname -r)" .config
-scripts/config --set-str LOCALVERSION "-cmp"      # installs alongside the stock kernel
+scripts/config --set-str LOCALVERSION "-cmp"
 scripts/config --disable LOCALVERSION_AUTO
 scripts/config --disable MODULE_SIG_ALL
 scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
@@ -118,20 +105,13 @@ sudo update-initramfs -c -k "$(make -s kernelrelease)"
 sudo update-grub
 ```
 
-`LOCALVERSION=-cmp` keeps the stock kernel installed and in the GRUB menu, which
-is worth doing — if the patched kernel misbehaves you pick the stock entry and
-you are back to a working machine with 64MB BARs and no P2P.
+If the patched kernel misbehaves, pick the stock GRUB entry: 64MB BARs, no P2P.
 
-`make bindeb-pkg` does not work here: the generated `debian/control` wants
-`debhelper-compat (= 12)` and current releases ship debhelper 13.
-
-**Pin your kernel packages afterwards.** A distro kernel upgrade arrives without
-these patches and silently drops both P2P and the large BARs:
-
-```bash
-sudo apt-mark hold linux-image-generic-hwe-26.04 linux-headers-generic-hwe-26.04 \
-                   linux-image-"$(uname -r)" linux-headers-"$(uname -r)"
-```
+**Pin the kernel packages afterwards.** A distro kernel upgrade arrives without
+these patches and silently drops both P2P and the large BARs. Hold the image
+and headers packages for the series you boot, including the running
+`linux-image-$(uname -r)` / `linux-headers-$(uname -r)` (or the equivalent on
+rpm/pacman).
 
 ## Verifying
 
@@ -140,6 +120,9 @@ sudo dmesg | grep 'CMP 170HX'
 #  CMP 170HX: BAR1 REBAR programmed to 64GB before enumeration (cap 0x1ffc00 ctrl 0x1001)
 #  cap/ctrl of 0xffffffff means the register window was not reachable
 
-sudo lspci -vv -s 0c:00.0 | grep 'Region 1'
-#  Region 1: Memory at ... [size=64G]
+for d in $(lspci -D -d 10de: -n | awk '{print $1}'); do
+    echo "===== $d ====="
+    sudo lspci -vv -s "$d" | grep -E 'Region 1|Region 3'
+done
+# Region 1 should be [size=64G] on every GPU
 ```
