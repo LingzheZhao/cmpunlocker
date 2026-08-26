@@ -6,9 +6,10 @@ unlock — that all works on a stock kernel. They exist to make **BAR1 P2P**
 usable, and to make the large BAR1 come up on a normal boot instead of needing
 a `kexec` trick.
 
-A default `install.sh` run patches the NVIDIA modules and writes
-`RMForceStaticBar1=1` / `RMPcieP2PType=1`. Without these kernel patches, some
-GPUs silently keep a 64MB BAR1 and BAR1 P2P cannot cover framebuffer.
+A default `install.sh` run patches the NVIDIA modules for BAR1 P2P. Do not
+pass `RMForceStaticBar1` / `RMPcieP2PType` through `NVreg_RegistryDwords` —
+GSP 610.43.02 rejects those keys. Without these kernel patches, some GPUs
+silently keep a 64MB BAR1 and BAR1 P2P cannot cover framebuffer.
 
 Brought up in [bayley/cmpunlocker](https://github.com/bayley/cmpunlocker)
 against `linux-source-7.0.0` (Ubuntu 26.04, release `7.0.12-cmp`) on a

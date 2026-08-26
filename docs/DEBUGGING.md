@@ -24,8 +24,10 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
   every GPU (`sudo dmesg | grep 'CMP BAR1'` / `lspci -vv` Region 1).
 - Driver-time BAR1 resize cannot grow parent bridge windows. Apply the patches
   in `kernel-patches/` and reboot.
-- Confirm `RMForceStaticBar1=1` and `RMPcieP2PType=1` are in
-  `/etc/modprobe.d/cmp-pcie-gen2.conf` and that initramfs was rebuilt.
+- Do not add `RMForceStaticBar1` or `RMPcieP2PType` to
+  `NVreg_RegistryDwords`. GSP 610.43.02 returns `NV_ERR_INVALID_REGISTRY_KEY`
+  and leaves WPR2 up; BAR1 P2P type is forced in the driver for CMP IDs.
+- After that failure the card needs a cold power-off, not `reboot`.
 - ACS redirect on a switch (`ReqRedir+`) forces peer traffic up to the root
   complex. Check `lspci -vv | grep ACSCtl`.
 - Do not set `NVreg_RegistryDwords="ForceP2P=0x11"` and do not unload/reload

@@ -249,26 +249,13 @@ CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}" \
 ok "Patched modules installed (profile ${CARD_PROFILE})"
 
 info "Configuring PCIe Gen2"
-NVIDIA_REGISTRY_DWORDS="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"
-if (( ENABLE_P2P == 1 )); then
-    NVIDIA_REGISTRY_DWORDS="${NVIDIA_REGISTRY_DWORDS};RMForceStaticBar1=1;RMPcieP2PType=1"
-fi
-printf 'options nvidia NVreg_RegistryDwords="%s"\n' "${NVIDIA_REGISTRY_DWORDS}" \
+# Do not put RMForceStaticBar1 / RMPcieP2PType in NVreg_RegistryDwords.
+# GSP 610.43.02 rejects them as NV_ERR_INVALID_REGISTRY_KEY and then leaves
+# WPR2 up. BAR1 P2P type is forced in the driver patches for CMP IDs instead.
+printf '%s\n' \
+    'options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"' \
     > /etc/modprobe.d/cmp-pcie-gen2.conf
 ok "Wrote /etc/modprobe.d/cmp-pcie-gen2.conf"
-if (( ENABLE_P2P == 1 )); then
-    # nvidia loads from initramfs; build.sh already rebuilt it before this file existed.
-    if command -v update-initramfs &>/dev/null; then
-        update-initramfs -u -k "$(uname -r)"
-    elif command -v dracut &>/dev/null; then
-        dracut --force --kver "$(uname -r)"
-    elif command -v mkinitcpio &>/dev/null; then
-        mkinitcpio -P
-    else
-        warn "No initramfs tool found — rebuild it so RMForceStaticBar1 takes effect"
-    fi
-    ok "Rebuilt initramfs with BAR1 P2P module options"
-fi
 
 for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
     systemctl disable --now "${legacy_unit}" 2>/dev/null || true
