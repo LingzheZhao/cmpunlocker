@@ -865,12 +865,16 @@ rebuild_initramfs() {
 
 rebuild_initramfs || \
     die "Could not rebuild initramfs; patched modules are not safe to activate"
-resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
+# Use modinfo, not `modprobe -n`. If nvidia is already loaded, kmod's dry-run
+# prints nothing even when the on-disk module is correct.
+resolved="$(modinfo -k "${KVER}" -n nvidia 2>/dev/null || true)"
 [[ -n "${resolved}" ]] || \
-    die "modprobe cannot resolve the installed nvidia module for ${KVER}"
-info "modprobe will load: ${resolved}"
-[[ "${resolved}" == *"/updates/cmpunlocker/"* ]] || \
-    die "modprobe resolves outside updates/cmpunlocker: ${resolved}"
+    die "modinfo cannot resolve nvidia for ${KVER}"
+resolved="$(readlink -e -- "${resolved}" 2>/dev/null || true)"
+expected="$(readlink -e -- "${INSTALL_MOD_DIR}/nvidia.ko" 2>/dev/null || true)"
+[[ -n "${resolved}" && -n "${expected}" && "${resolved}" == "${expected}" ]] || \
+    die "nvidia resolves to '${resolved:-?}', expected '${expected:-?}'"
+info "nvidia resolves to ${resolved}"
 echo ""
 ok "Patched modules installed on disk; the running NVIDIA driver was left untouched"
 warn "Do not hot-reload or warm-reboot this geometry/WPR-changing driver"
