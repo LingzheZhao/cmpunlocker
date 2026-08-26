@@ -68,20 +68,15 @@ SEC2_DEBUG_PMA_GUARD: ... status=safe ... build=cmpunlocker-safety-v4
 ```
 
 Any rejected layout, allocator mismatch, or missing check is a stop condition.
-The preceding `cmpunlocker-safety-v3` build completed a post-reboot hardware
-test on a `10de:20c2` card with driver 610.57.04, including a 56 GiB
-bidirectional copy and full readback. This `cmpunlocker-safety-v4` revision adds
-fail-closed region-capacity and insertion checks; it has passed source,
-boundary, and full-module-build validation but still requires installation and
-a new hardware test. The `10de:2082` 40 GiB path has source and boundary-test
-coverage but has not completed the same hardware test.
+`cmpunlocker-safety-v4` has been installed and cold-booted on multiple hosts,
+including both `10de:20c2` (64 GiB) and `10de:2082` (40 GiB).
 
 ## What Gets Unlocked
 
 | Feature | Status |
 |---|---|
 | Full SM compute throughput (SS0/SS1) | Working ✓ |
-| Memory geometry | 64 GiB (`10de:20c2`): v3 hardware-tested, v4 source/build-tested; 40 GiB (`10de:2082`): source-tested |
+| Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`) |
 | PCIe Gen 2 speeds | Working ✓ |
 | Full BAR1 Size (64GB) | Working ✓ |
 | JTAG (Host2Jtag register access) | Working ✓ |
