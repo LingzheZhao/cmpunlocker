@@ -16,7 +16,7 @@ if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Leaves running NVIDIA modules untouched until a required cold power-off"
-    echo "  - Removes cmpretrain service / modprobe Gen2 helpers"
+    echo "  - Removes cmpretrain service / modprobe Gen2 and P2P helpers"
     echo "  - Restores the pre-install kernel command line (reverts IOMMU changes)"
     echo ""
     echo "Run: sudo ./remove.sh --yes"

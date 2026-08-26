@@ -49,6 +49,18 @@ sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
 
+GPU-to-GPU P2P is off by default. To enable the BAR1 P2P path:
+
+```bash
+sudo ./install.sh --p2p
+```
+
+This requires 64GB BAR1 on every GPU. Driver-time resize is not enough for
+that on multi-GPU systems; apply the optional host-kernel patches in
+`kernel-patches/` and add `pci=realloc pci=hpmmioprefsize=2T` (the installer
+adds those command-line tokens when `--p2p` is used). `nvidia-smi topo -p2p`
+reporting OK is not proof of working transfers.
+
 The driver changes both memory geometry and firmware-protected memory ranges.
 Do not hot-reload the NVIDIA modules or rely on a warm reboot. Shut the machine
 down completely, remove standby power long enough for the card to lose state,
@@ -79,6 +91,7 @@ including both `10de:20c2` (64 GiB) and `10de:2082` (40 GiB).
 | Memory geometry | 64 GiB (`10de:20c2`); 40 GiB (`10de:2082`) |
 | PCIe Gen 2 speeds | Working ✓ |
 | Full BAR1 Size (64GB) | Working ✓ |
+| GPU-to-GPU P2P (`cudaDeviceEnablePeerAccess`) | Opt-in (`--p2p`); BAR1 P2P, needs 64GB BAR1 and `kernel-patches/` |
 | JTAG (Host2Jtag register access) | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |
 
