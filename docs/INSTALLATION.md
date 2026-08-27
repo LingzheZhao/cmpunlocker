@@ -39,6 +39,10 @@ real peer copy.
 
 Then perform a cold reboot (full power off, then boot).
 
+`install.sh` does not patch the host kernel. For 64GB BAR1, build a `-cmp`
+kernel from `kernel-patches/` (6.8: `linux-6.8/`), boot it, then run
+`install.sh` again. See `kernel-patches/README.md`.
+
 ## Uninstall
 
 To uninstall cmpunlocker, run the following command:

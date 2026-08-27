@@ -35,6 +35,15 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
 
 ---
 
+## BAR1 is still 64MB after `pci=realloc`
+
+- Cmdline realloc cannot grow a BAR that enumeration already sized as 64MB.
+  The host-kernel patches in `kernel-patches/` have to run before
+  `pci_read_bases()`. `dmesg | grep 'CMP 170HX'` should show
+  `BAR1 REBAR programmed to 64GB` with `cap 0x1ffc00`, not `0xffffffff`.
+
+---
+
 ## PCIe still at Gen1 after install
 
 - Confirm IOMMU passthrough mode is enabled. Depending on your operating system, enabling IOMMU passthrough can vary.

@@ -1,0 +1,26 @@
+PCI: size bridge windows for child alignment padding
+
+Adapted from the linux-7.0 version: on 6.8, `size += max(r_size, align)`
+sits after the alignment-order check in pbus_size_mem(), not immediately
+after `r_size = resource_size(r)`.
+
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -1054,7 +1054,16 @@
+ 				r->flags = 0;
+ 				continue;
+ 			}
+-			size += max(r_size, align);
++
++			/*
++			 * Every child must start at an aligned address, so a
++			 * child whose size is not a multiple of its alignment
++			 * leaves a gap before the next one. Round up so that
++			 * padding is included; this is identical to
++			 * max(r_size, align) whenever r_size <= align, which
++			 * covers ordinary device BARs where size == alignment.
++			 */
++			size += ALIGN(r_size, align);
+ 			/*
+ 			 * Exclude ranges with size > align from calculation of
+ 			 * the alignment.

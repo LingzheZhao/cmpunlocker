@@ -53,9 +53,9 @@ GPU-to-GPU BAR1 P2P is on by default. Pass `--no-p2p` to leave it off.
 
 This requires 64GB BAR1 on every GPU. Driver-time resize is not enough for
 that on multi-GPU systems; apply the optional host-kernel patches in
-`kernel-patches/`. The installer adds `pci=realloc pci=hpmmioprefsize=2T`
-when P2P is enabled. `nvidia-smi topo -p2p` reporting OK is not proof of
-working transfers.
+`kernel-patches/` (`install.sh` does not; 6.8 uses `linux-6.8/`). The
+installer adds `pci=realloc pci=hpmmioprefsize=2T` when P2P is enabled.
+`nvidia-smi topo -p2p` reporting OK is not proof of working transfers.
 
 The driver changes both memory geometry and firmware-protected memory ranges.
 Do not hot-reload the NVIDIA modules or rely on a warm reboot. Shut the machine

@@ -11,9 +11,10 @@ pass `RMForceStaticBar1` / `RMPcieP2PType` through `NVreg_RegistryDwords` —
 GSP 610.43.02 rejects those keys. Without these kernel patches, some GPUs
 silently keep a 64MB BAR1 and BAR1 P2P cannot cover framebuffer.
 
-Sourced from [bayley/cmpunlocker](https://github.com/bayley/cmpunlocker). The
-hunks were written against Linux 7.0; they may need a one-line context tweak
-on other series. Keep the distro kernel installed as a GRUB fallback.
+Sourced from [bayley/cmpunlocker](https://github.com/bayley/cmpunlocker).
+Hunks in this directory match Linux 7.0; `linux-6.8/` is the same changes
+for 6.8. Keep the distro kernel installed as a GRUB fallback via
+`LOCALVERSION=-cmp`.
 
 ## 0001 — `pbus_size_mem()`: size bridge windows for child alignment padding
 
@@ -77,35 +78,63 @@ BAR.
 
 ## Building
 
-Use kernel source that matches the series you actually boot (`uname -r`), not
-an arbitrary distro `linux-source` metapackage. Apply both patches, keep the
-stock kernel as a GRUB fallback via `LOCALVERSION=-cmp`, and pin whatever
-packages your distro uses to install that series so an upgrade does not
-silently drop the patches.
+Use kernel source that matches the series you actually boot (`uname -r`). On
+Ubuntu, that is `apt-get source linux-image-unsigned-$(uname -r)` (or the
+matching Launchpad `.dsc`), **not** the `linux-source` metapackage — on 22.04
+that package is 5.15 even when HWE 6.8 is running.
+
+| Series | Patches |
+|---|---|
+| Linux 7.0 | `0001-*.patch` `0002-*.patch` (this directory) |
+| Linux 6.8 | `linux-6.8/0001-*.patch` `linux-6.8/0002-*.patch` |
+
+On another series, 0001 is `size += max(r_size, align)` → `ALIGN(...)` in
+`pbus_size_mem()` (`drivers/pci/setup-bus.c`); 0002 is the quirk appended at
+the end of `drivers/pci/quirks.c`. Apply with `--fuzz=0`.
 
 ```bash
-# Debian/Ubuntu example: source for the running series, then:
-patch -p1 < /path/to/kernel-patches/0001-*.patch
-patch -p1 < /path/to/kernel-patches/0002-*.patch
+# Debian/Ubuntu example:
+patch -p1 --fuzz=0 < /path/to/the/matching/0001-*.patch
+patch -p1 --fuzz=0 < /path/to/the/matching/0002-*.patch
 
 cp /boot/config-"$(uname -r)" .config
 scripts/config --set-str LOCALVERSION "-cmp"
 scripts/config --disable LOCALVERSION_AUTO
 scripts/config --disable MODULE_SIG_ALL
+scripts/config --set-str MODULE_SIG_KEY ""
 scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
 scripts/config --disable DEBUG_INFO
 scripts/config --enable  DEBUG_INFO_NONE
+scripts/config --disable DEBUG_INFO_BTF
 make olddefconfig
-make -j"$(nproc)"
+make CC=gcc-12 HOSTCC=gcc-12 -j"$(nproc)"
+```
+
+`gcc-12` (or newer) is required when the distro config has
+`CONFIG_INIT_STACK_ALL_ZERO=y` — Ubuntu 22.04's default `gcc` is 11. Clear the
+`SYSTEM_*_KEYS` / `MODULE_SIG_*` paths; they point at files that only exist in
+the distro kernel package. `LOCALVERSION=-cmp` on Ubuntu HWE 6.8 source yields
+`6.8.12-cmp` (Makefile `SUBLEVEL=12`), not `6.8.0-NNN-generic-cmp`.
+
+```bash
+sudo apt install build-essential bc bison flex libssl-dev libelf-dev gcc-12
 
 sudo make modules_install
 sudo cp arch/x86/boot/bzImage /boot/vmlinuz-"$(make -s kernelrelease)"
+sudo cp System.map /boot/System.map-"$(make -s kernelrelease)"
+sudo cp .config /boot/config-"$(make -s kernelrelease)"
 sudo update-initramfs -c -k "$(make -s kernelrelease)"
-sudo update-grub
 ```
 
-If the patched kernel misbehaves, pick the stock GRUB entry: 64MB BARs, no P2P.
+Leave the stock kernel installed. If GRUB is hidden (`GRUB_TIMEOUT=0`), give
+it a visible timeout before `update-grub` so a bad `-cmp` image is recoverable
+via **Advanced options**. Ubuntu sorts by version, so `6.8.12-cmp` becomes the
+default ahead of `6.8.0-*-generic`.
+
+The new kver has no nvidia module until you boot it and run `sudo ./install.sh`
+from this tree. Do not `--reinstall` distro `nvidia-dkms-*`. Then cold
+power-off.
 
 **Pin the kernel packages afterwards.** A distro kernel upgrade arrives without
 these patches and silently drops both P2P and the large BARs. Hold the image
@@ -126,3 +155,9 @@ for d in $(lspci -D -d 10de: -n | awk '{print $1}'); do
 done
 # Region 1 should be [size=64G] on every GPU
 ```
+
+A first pass of `can't assign; no space` then `assigned` is `pci=realloc`
+placing the 64GB windows. Stuck at 64MB after that means the quirk did not
+take or the parent window is still short.
+
+If the patched kernel misbehaves, pick the stock GRUB entry: 64MB BARs, no P2P.
