@@ -30,7 +30,18 @@ sudo ./install.sh --profile=8gb    # 8GB card → 64GB unlock
 sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 ```
 
+GPU-to-GPU BAR1 P2P is on by default. Pass `--no-p2p` to leave it off. When
+enabled, the installer also adds `pci=realloc pci=hpmmioprefsize=2T`. 64GB
+BAR1 on every GPU is required; the optional host-kernel patches in
+`kernel-patches/` are what make that BAR come up from a normal boot. After
+reboot, `nvidia-smi topo -p2p r` reporting OK is not proof — verify with a
+real peer copy.
+
 Then perform a cold reboot (full power off, then boot).
+
+`install.sh` does not patch the host kernel. For 64GB BAR1, build a `-cmp`
+kernel from `kernel-patches/` (6.8: `linux-6.8/`), boot it, then run
+`install.sh` again. See `kernel-patches/README.md`.
 
 ## Uninstall
 

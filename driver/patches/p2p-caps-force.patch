@@ -1,0 +1,27 @@
+--- a/src/nvidia/src/kernel/gpu/gpu.c
++++ b/src/nvidia/src/kernel/gpu/gpu.c
+@@ -2517,6 +2517,24 @@
+ 
+     pGpu->pcieP2PReadCaps = p2pCapsParams.p2pReadCapsStatus;
+     pGpu->pcieP2PWriteCaps = p2pCapsParams.p2pWriteCapsStatus;
++
++    //
++    // cmpunlocker P2P: GSP reports PCIe P2P unsupported on CMP. BAR1 P2P is the
++    // working path; force the advertised caps to OK so CUDA and nvidia-smi see
++    // it. This is compiled in when BAR1 P2P is enabled (the install default).
++    //
++    {
++        NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;
++
++        if ((cmpDevId == 0x20C2) || (cmpDevId == 0x2082))
++        {
++            pGpu->pcieP2PReadCaps = 0;
++            pGpu->pcieP2PWriteCaps = 0;
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMPUNLOCK_BAR1P2P: GSP P2P caps forced to OK (devId=0x%x)\n",
++                      cmpDevId);
++        }
++    }
+ }
+ 
+ static void

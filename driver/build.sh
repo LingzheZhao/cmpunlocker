@@ -35,13 +35,56 @@ version_supported() {
     return 1
 }
 
+cc_supports_auto_var_init() {
+    local cc="$1"
+    echo 'int x;' | "${cc}" -ftrivial-auto-var-init=zero -x c -c -o /dev/null - >/dev/null 2>&1
+}
+
+kernel_needs_auto_var_init() {
+    local config
+    for config in \
+        "${KSRC}/include/config/auto.conf" \
+        "${KSRC}/.config" \
+        "/boot/config-${KVER}"; do
+        [[ -r "${config}" ]] || continue
+        grep -q '^CONFIG_INIT_STACK_ALL_ZERO=y' "${config}" && return 0
+        return 1
+    done
+    return 1
+}
+
+select_kernel_cc() {
+    local cand
+    if [[ -n "${CMPUNLOCKER_CC:-}" ]]; then
+        command -v "${CMPUNLOCKER_CC}" &>/dev/null || \
+            die "CMPUNLOCKER_CC='${CMPUNLOCKER_CC}' not found"
+        if kernel_needs_auto_var_init && ! cc_supports_auto_var_init "${CMPUNLOCKER_CC}"; then
+            die "CMPUNLOCKER_CC='${CMPUNLOCKER_CC}' does not support -ftrivial-auto-var-init=zero required by kernel ${KVER}"
+        fi
+        KERNEL_CC="${CMPUNLOCKER_CC}"
+        return
+    fi
+    if kernel_needs_auto_var_init; then
+        for cand in gcc-14 gcc-13 gcc-12 gcc; do
+            command -v "${cand}" &>/dev/null || continue
+            cc_supports_auto_var_init "${cand}" || continue
+            KERNEL_CC="${cand}"
+            return
+        done
+        die "Kernel ${KVER} requires GCC 12+ (-ftrivial-auto-var-init=zero). Install gcc-12 or set CMPUNLOCKER_CC"
+    fi
+    command -v gcc &>/dev/null || die "gcc is required to build modules and run safety checks"
+    KERNEL_CC=gcc
+}
+
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
 version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (supported: ${SUPPORTED_VERSIONS[*]})"
 [[ -d "${PATCH_DIR}" ]] || die "Missing patches directory: ${PATCH_DIR}"
 [[ -d "${KSRC}" ]] || die "Kernel headers not found at ${KSRC}. Install linux-headers-${KVER} (or kernel-devel)."
 command -v python3 &>/dev/null || die "python3 is required to apply the card memory profile"
-command -v gcc &>/dev/null || die "gcc is required to build modules and run safety checks"
+select_kernel_cc
+info "Using ${KERNEL_CC} to build modules for kernel ${KVER}"
 info "Building against open-gpu-kernel-modules ${VERSION}"
 
 PATCH_ORDER=(
@@ -57,6 +100,24 @@ PATCH_ORDER=(
     bar1-resize-unlock.patch
     sec2-payload-safety.patch
 )
+P2P_PATCH_ORDER=(
+    p2p-bar1.patch
+    p2p-skip-mailbox-peer-preinit.patch
+    p2p-bar1-readcap-override.patch
+    p2p-caps-force.patch
+)
+ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-1}"
+case "${ENABLE_P2P}" in
+    0|"") ENABLE_P2P=0 ;;
+    1) ENABLE_P2P=1 ;;
+    *) die "CMPUNLOCKER_ENABLE_P2P must be 0 or 1 (got '${ENABLE_P2P}')" ;;
+esac
+if (( ENABLE_P2P == 1 )); then
+    PATCH_ORDER+=("${P2P_PATCH_ORDER[@]}")
+    info "GPU-to-GPU BAR1 P2P patches enabled"
+else
+    info "GPU-to-GPU P2P left off (CMPUNLOCKER_ENABLE_P2P=0)"
+fi
 PATCH_FILES=()
 for name in "${PATCH_ORDER[@]}"; do
     p="${PATCH_DIR}/${name}"
@@ -183,10 +244,10 @@ PMA_GUARD_TEST="${SCRIPT_DIR}/../tools/test-pma-guard.py"
     die "Missing FB-region validator self-test: ${FB_REGION_VALIDATOR_TEST}"
 [[ -f "${PMA_GUARD_TEST}" ]] || \
     die "Missing materialized FB/PMA guard self-test: ${PMA_GUARD_TEST}"
-HOSTCC=gcc python3 "${FB_REGION_VALIDATOR_TEST}" "${GSP_C}" || \
+HOSTCC="${KERNEL_CC}" python3 "${FB_REGION_VALIDATOR_TEST}" "${GSP_C}" || \
     die "Native FB-region validator source/semantic self-test failed"
 ok "Native FB-region validator passed compiled boundary-value tests"
-HOSTCC=gcc python3 "${PMA_GUARD_TEST}" "${MEM_MGR_C}" || \
+HOSTCC="${KERNEL_CC}" python3 "${PMA_GUARD_TEST}" "${MEM_MGR_C}" || \
     die "Materialized FB/PMA guard source/semantic self-test failed"
 ok "Materialized FB/PMA guard passed compiled fail-closed tests"
 
@@ -747,9 +808,9 @@ find . -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
 rm -rf src/nvidia/_out src/nvidia-modeset/_out kernel-open/conftest 2>/dev/null || true
 
 JOBS="$(nproc)"
-CC_CMD="gcc"
+CC_CMD="${KERNEL_CC}"
 if command -v ccache &>/dev/null; then
-    CC_CMD="ccache gcc"
+    CC_CMD="ccache ${KERNEL_CC}"
     info "ccache detected — compiler output will be cached for faster rebuilds"
 fi
 make -j"${JOBS}" modules SYSSRC="${KSRC}" CC="${CC_CMD}"
@@ -804,12 +865,16 @@ rebuild_initramfs() {
 
 rebuild_initramfs || \
     die "Could not rebuild initramfs; patched modules are not safe to activate"
-resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
+# Use modinfo, not `modprobe -n`. If nvidia is already loaded, kmod's dry-run
+# prints nothing even when the on-disk module is correct.
+resolved="$(modinfo -k "${KVER}" -n nvidia 2>/dev/null || true)"
 [[ -n "${resolved}" ]] || \
-    die "modprobe cannot resolve the installed nvidia module for ${KVER}"
-info "modprobe will load: ${resolved}"
-[[ "${resolved}" == *"/updates/cmpunlocker/"* ]] || \
-    die "modprobe resolves outside updates/cmpunlocker: ${resolved}"
+    die "modinfo cannot resolve nvidia for ${KVER}"
+resolved="$(readlink -e -- "${resolved}" 2>/dev/null || true)"
+expected="$(readlink -e -- "${INSTALL_MOD_DIR}/nvidia.ko" 2>/dev/null || true)"
+[[ -n "${resolved}" && -n "${expected}" && "${resolved}" == "${expected}" ]] || \
+    die "nvidia resolves to '${resolved:-?}', expected '${expected:-?}'"
+info "nvidia resolves to ${resolved}"
 echo ""
 ok "Patched modules installed on disk; the running NVIDIA driver was left untouched"
 warn "Do not hot-reload or warm-reboot this geometry/WPR-changing driver"

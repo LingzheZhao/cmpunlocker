@@ -1,0 +1,35 @@
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -309,11 +309,31 @@
+ 
+         if (gpumgrGetGpuLinkCount(pGpu->gpuInstance) > 0)
+         {
++            KernelBif *pKernelBifP2P = GPU_GET_KERNEL_BIF(pGpu);
++
++            //
++            // cmpunlocker P2P: _kbusInitP2P_GM107 unconditionally pre-registers a
++            // mailbox peer id for every GPU pair, leaving p2pPcie.peerNumberMask
++            // non-zero before any P2P is ever requested. BAR1 P2P refuses to
++            // coexist with a mailbox peer (gate 4 of
++            // kbusIsPcieBar1P2PMappingSupported_GH100), so that pre-registration
++            // permanently blocks BAR1 P2P. When BAR1 P2P is the intended path,
++            // skip it and leave the mask clear.
++            //
+             if (!kbusIsP2pInitialized(pKernelBus) &&
+-                !kbusIsP2pMailboxClientAllocated(pKernelBus))
++                !kbusIsP2pMailboxClientAllocated(pKernelBus) &&
++                ((pKernelBifP2P == NULL) ||
++                 (pKernelBifP2P->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_BAR1)))
+             {
+                 _kbusInitP2P_GM107(pGpu, pKernelBus);
+             }
++            else if ((pKernelBifP2P != NULL) &&
++                     (pKernelBifP2P->pcieP2PType == NV_REG_STR_RM_PCIEP2P_TYPE_BAR1))
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "CMPUNLOCK_BAR1P2P: skipping mailbox peer pre-registration "
++                          "(pcieP2PType=BAR1) so peerNumberMask stays clear\n");
++            }
+         }
+     }
+ 

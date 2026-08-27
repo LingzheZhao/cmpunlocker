@@ -11,19 +11,28 @@ LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
 PROFILE_OVERRIDE=""
 CONFIGURE_IOMMU=1
 CONFIGURE_GEN2_SERVICE=1
+ENABLE_P2P=1
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
+        --p2p) ENABLE_P2P=1 ;;
+        --no-p2p) ENABLE_P2P=0 ;;
         --no-iommu) CONFIGURE_IOMMU=0 ;;
         --no-gen2-service) CONFIGURE_GEN2_SERVICE=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu] [--no-gen2-service]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-p2p] [--no-iommu] [--no-gen2-service]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
-  --no-iommu      Do not touch the kernel command line (leave IOMMU settings alone)
+  --no-p2p        Disable GPU-to-GPU BAR1 P2P. It is on by default.
+                  BAR1 P2P needs 64GB BAR1 on every GPU; the host kernel
+                  patches in kernel-patches/ are needed for that BAR to come
+                  up from a normal boot. nvidia-smi topo -p2p is not proof —
+                  verify with a real peer copy.
+  --p2p           Explicitly enable BAR1 P2P (the default)
+  --no-iommu      Do not add IOMMU passthrough kernel parameters
   --no-gen2-service
                   Do not install the early-boot PCIe Gen2 retrain service
 
@@ -116,6 +125,20 @@ if (( COUNT_UNSUPPORTED > 0 )); then
 else
     info "Inventory: ${#GPU_BDFS[@]} unlockable (${COUNT_8GB}× 8gb, ${COUNT_10GB}× 10gb)"
 fi
+
+if (( ENABLE_P2P == 1 )); then
+    ok "GPU-to-GPU BAR1 P2P requested"
+    warn "This makes the driver advertise P2P and select the BAR1 path."
+    warn "nvidia-smi topo -p2p is not proof; verify with a real peer copy."
+    warn "64GB BAR1 on every GPU is required. Driver-time resize is too late"
+    warn "for bridge-window sizing — see kernel-patches/README.md"
+    if (( ${#GPU_BDFS[@]} < 2 )); then
+        warn "Only one unlockable GPU is present; P2P has no peer until a second card is added"
+    fi
+else
+    info "P2P left off (--no-p2p)"
+fi
+export CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}"
 
 step "Selecting card memory profile"
 CARD_PROFILE=""
@@ -221,14 +244,29 @@ chmod +x "${SCRIPT_DIR}/driver/build.sh"
 CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
 CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
+CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}" \
     "${SCRIPT_DIR}/driver/build.sh"
 ok "Patched modules installed (profile ${CARD_PROFILE})"
 
 info "Configuring PCIe Gen2"
-cat > /etc/modprobe.d/cmp-pcie-gen2.conf <<'EOF'
-options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"
-EOF
+# GSP 610.43.02 rejects RMForceStaticBar1 / RMPcieP2PType in
+# NVreg_RegistryDwords (NV_ERR_INVALID_REGISTRY_KEY) and leaves WPR2 up.
+# Always rewrite this file so a reinstall heals a poisoned conf. BAR1 P2P
+# type is forced in the driver patches for CMP IDs instead.
+printf '%s\n' \
+    'options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"' \
+    > /etc/modprobe.d/cmp-pcie-gen2.conf
 ok "Wrote /etc/modprobe.d/cmp-pcie-gen2.conf"
+if command -v update-initramfs &>/dev/null; then
+    update-initramfs -u -k "$(uname -r)"
+elif command -v dracut &>/dev/null; then
+    dracut --force --kver "$(uname -r)"
+elif command -v mkinitcpio &>/dev/null; then
+    mkinitcpio -P
+else
+    warn "No initramfs tool found — rebuild it so nvidia does not keep old RegistryDwords"
+fi
+ok "Rebuilt initramfs after nvidia module options"
 
 for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
     systemctl disable --now "${legacy_unit}" 2>/dev/null || true
@@ -250,9 +288,12 @@ else
     warn "--no-gen2-service given; early-boot PCIe retraining is not installed"
 fi
 
-info "Configuring IOMMU (passthrough)"
+info "Configuring kernel command line"
 IOMMU_STATUS="skipped"
 IOMMU_PARAMS=""
+CMDLINE_PARAMS=""
+CMDLINE_STRIP_IOMMU=0
+CMDLINE_STRIP_BAR1=0
 
 iommu_params_for_cpu() {
     local vendor=""
@@ -266,14 +307,23 @@ iommu_params_for_cpu() {
 
 cmdline_merge() {
     local current="$1"
-    local token out=()
+    local token skip
+    local out=()
     for token in ${current}; do
-        case "${token}" in
-            intel_iommu=*|amd_iommu=*|iommu=*) continue ;;
-            *) out+=("${token}") ;;
-        esac
+        skip=0
+        if (( CMDLINE_STRIP_IOMMU == 1 )); then
+            case "${token}" in
+                intel_iommu=*|amd_iommu=*|iommu=*) skip=1 ;;
+            esac
+        fi
+        if (( skip == 0 && CMDLINE_STRIP_BAR1 == 1 )); then
+            case "${token}" in
+                pci=realloc|pci=hpmmioprefsize=*) skip=1 ;;
+            esac
+        fi
+        (( skip == 1 )) || out+=("${token}")
     done
-    for token in ${IOMMU_PARAMS}; do
+    for token in ${CMDLINE_PARAMS}; do
         out+=("${token}")
     done
     echo "${out[*]}"
@@ -293,7 +343,7 @@ configure_iommu_grub() {
     merged="$(cmdline_merge "${current}")"
 
     if [[ "${current}" == "${merged}" ]]; then
-        ok "GRUB already has ${IOMMU_PARAMS} (${key})"
+        ok "GRUB already has ${CMDLINE_PARAMS} (${key})"
         IOMMU_STATUS="already-set"
         return 0
     fi
@@ -333,7 +383,7 @@ configure_iommu_kernel_cmdline() {
     merged="$(cmdline_merge "${current}")"
 
     if [[ "${current}" == "${merged}" ]]; then
-        ok "${file} already has ${IOMMU_PARAMS}"
+        ok "${file} already has ${CMDLINE_PARAMS}"
         IOMMU_STATUS="already-set"
         return 0
     fi
@@ -357,28 +407,49 @@ configure_iommu_kernel_cmdline() {
 }
 
 if (( CONFIGURE_IOMMU == 0 )); then
-    warn "--no-iommu given; leaving kernel command line untouched"
+    warn "--no-iommu given; not adding IOMMU passthrough kernel parameters"
 else
     IOMMU_PARAMS="$(iommu_params_for_cpu)"
     if [[ -z "${IOMMU_PARAMS}" ]]; then
         warn "Unrecognized CPU vendor — cannot pick IOMMU kernel parameters; skipping"
-    elif [[ -f /etc/default/grub ]]; then
-        info "Target: ${IOMMU_PARAMS} (GRUB)"
+    else
+        CMDLINE_PARAMS="${IOMMU_PARAMS}"
+        CMDLINE_STRIP_IOMMU=1
+    fi
+fi
+if (( ENABLE_P2P == 1 )); then
+    CMDLINE_PARAMS="${CMDLINE_PARAMS:+${CMDLINE_PARAMS} }pci=realloc pci=hpmmioprefsize=2T"
+    CMDLINE_STRIP_BAR1=1
+    info "BAR1 P2P: pci=realloc pci=hpmmioprefsize=2T"
+fi
+
+if [[ -n "${CMDLINE_PARAMS}" ]]; then
+    if [[ -f /etc/default/grub ]]; then
+        info "Target: ${CMDLINE_PARAMS} (GRUB)"
         configure_iommu_grub
     elif [[ -f /etc/kernel/cmdline ]]; then
-        info "Target: ${IOMMU_PARAMS} (systemd-boot)"
+        info "Target: ${CMDLINE_PARAMS} (systemd-boot)"
         configure_iommu_kernel_cmdline
     else
         warn "No /etc/default/grub or /etc/kernel/cmdline found"
-        warn "Add these to your kernel command line manually: ${IOMMU_PARAMS}"
+        warn "Add these to your kernel command line manually: ${CMDLINE_PARAMS}"
         IOMMU_STATUS="manual"
     fi
+fi
 
+if (( CONFIGURE_IOMMU == 1 )); then
     if grep -qw iommu=pt /proc/cmdline 2>/dev/null && [[ -d /sys/class/iommu ]] && [[ -n "$(ls -A /sys/class/iommu 2>/dev/null)" ]]; then
         ok "IOMMU is already active in passthrough mode on the running kernel"
-    elif [[ "${IOMMU_STATUS}" != "skipped" ]]; then
+    elif [[ "${IOMMU_STATUS}" != "skipped" && -n "${IOMMU_PARAMS}" ]]; then
         info "IOMMU passthrough takes effect after the next reboot"
         warn "IOMMU must also be enabled in BIOS/UEFI (VT-d / AMD-Vi / SVM)"
+    fi
+fi
+if (( ENABLE_P2P == 1 )); then
+    if grep -qw pci=realloc /proc/cmdline 2>/dev/null; then
+        ok "pci=realloc is already active on the running kernel"
+    else
+        info "BAR1 resize kernel parameters take effect after the next reboot"
     fi
 fi
 
@@ -386,10 +457,18 @@ step "Done"
 banner
 echo "cmpunlocker install finished!"
 echo "Profile: ${CARD_PROFILE}  |  ${#GPU_BDFS[@]} GPU(s): ${COUNT_8GB}× 8gb, ${COUNT_10GB}× 10gb"
+if (( ENABLE_P2P == 1 )); then
+    echo "P2P:     BAR1 P2P enabled (verify with a real peer copy, not nvidia-smi topo)"
+else
+    echo "P2P:     off"
+fi
 if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
     echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"
 else
     echo "IOMMU:   not configured"
+fi
+if (( ENABLE_P2P == 1 )); then
+    echo "BAR1 cmdline: pci=realloc pci=hpmmioprefsize=2T"
 fi
 echo ""
 echo "Per-GPU expectations after unlock:"
@@ -408,6 +487,12 @@ echo -e "  6. Verify IOMMU after reboot: ${CYAN}cat /proc/cmdline${NC} and ${CYA
 if (( CONFIGURE_GEN2_SERVICE == 1 )); then
     echo -e "  7. Verify negotiated Gen2: ${CYAN}sudo ./tools/service.sh verify${NC}"
     echo -e "     Recovery boot option: ${CYAN}systemd.mask=gen2.service${NC}"
+fi
+if (( ENABLE_P2P == 1 )); then
+    echo -e "  8. P2P logs: ${CYAN}sudo dmesg | grep CMPUNLOCK_BAR1P2P${NC}"
+    echo -e "     Advertised caps: ${CYAN}nvidia-smi topo -p2p r${NC}  (OK is not proof of working copies)"
+    echo -e "     BAR1 size: ${CYAN}sudo dmesg | grep 'CMP BAR1'${NC}  (expect 65536 MB on every GPU)"
+    echo -e "     Host kernel patches for reliable 64GB BAR1: ${CYAN}kernel-patches/README.md${NC}"
 fi
 echo ""
 echo "This script removed the nvidia DKMS kernel modules. You will need to re-run this script after each kernel upgrade"
