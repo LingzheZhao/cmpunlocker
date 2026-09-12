@@ -107,6 +107,8 @@ remains experimental and must not be treated as production-stable.
 | PCIe Gen 2 speeds | Working ✓ |
 | Full BAR1 Size (64GB) | Working ✓ |
 | JTAG (Host2Jtag register access) | Working ✓ |
+| VFIO-based passthrough | Working ✓ |
+| GPU profiling | Working ✓ |
 | Persistence across reboot (patched modules) | Working ✓ |
 
 ---
@@ -122,6 +124,10 @@ sudo ./remove.sh --yes
 The removal script leaves the running NVIDIA modules untouched. Shut the
 machine down completely, remove standby power long enough for the card to lose
 state, and only then power it on so the stock driver starts from reset hardware.
+
+## Contributions
+
+Please read [docs/CONTRIBUTING.md](https://github.com/amoghmunikote/cmpunlocker/blob/master/docs/CONTRIBUTING.md) before opening a PR.
 
 ## Support & Community
 

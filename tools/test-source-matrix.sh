@@ -23,6 +23,7 @@ PATCH_ORDER=(
     name-string.patch
     bar1-resize-unlock.patch
     sec2-payload-safety.patch
+    cmp-sku-mask.patch
 )
 
 python3 "${PROJECT_DIR}/tools/test-memory-geometry-consistency.py"

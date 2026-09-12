@@ -72,6 +72,7 @@ done
     die "Missing memory geometry consistency test: ${GEOMETRY_CONSISTENCY_TEST}"
 python3 "${GEOMETRY_CONSISTENCY_TEST}" || \
     die "Memory geometry constants and consumers have drifted"
+python3 -c "import yaml" 2>/dev/null || die "python3 PyYAML is required to read common/constants.yaml (apt install python3-yaml)"
 info "Building against open-gpu-kernel-modules ${VERSION}"
 
 PATCH_ORDER=(
@@ -86,6 +87,7 @@ PATCH_ORDER=(
     name-string.patch
     bar1-resize-unlock.patch
     sec2-payload-safety.patch
+    cmp-sku-mask.patch
 )
 PATCH_FILES=()
 for name in "${PATCH_ORDER[@]}"; do
@@ -133,6 +135,14 @@ case "${PROFILE}" in
         die "Unknown CMPUNLOCKER_CARD_PROFILE='${PROFILE}' (use 8gb, 10gb, or mixed)"
         ;;
 esac
+
+CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
+[[ -r "${CONSTANTS}" ]] || die "Missing ${CONSTANTS}"
+CONSTANTS_PROFILE="${PROFILE}"
+if [[ "${PROFILE}" == "10gb" && "${TEN_GB_TARGET}" == "80gb" ]]; then
+    CONSTANTS_PROFILE="10gb_80_experimental"
+fi
+python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${CONSTANTS_PROFILE}" >/dev/null || die "common/constants.yaml rejected (see error above)"
 
 mkdir -p "${BUILD_ROOT}"
 
