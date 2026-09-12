@@ -951,10 +951,10 @@ if [[ -e "${MODPROBE_OPTIONS_FILE}" ]]; then
 fi
 printf '%s\n' \
     'override nvidia * updates/cmpunlocker' \
-    'override nvidia_modeset * updates/cmpunlocker' \
-    'override nvidia_uvm * updates/cmpunlocker' \
-    'override nvidia_drm * updates/cmpunlocker' \
-    'override nvidia_peermem * updates/cmpunlocker' \
+    'override nvidia-modeset * updates/cmpunlocker' \
+    'override nvidia-uvm * updates/cmpunlocker' \
+    'override nvidia-drm * updates/cmpunlocker' \
+    'override nvidia-peermem * updates/cmpunlocker' \
     > "${TRANSACTION_STATE}/depmod.conf.new"
 printf '%s\n' \
     'options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"' \

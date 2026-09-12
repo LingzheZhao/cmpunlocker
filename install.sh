@@ -237,7 +237,7 @@ export CMPUNLOCKER_GPU_INVENTORY="$(printf '%s\n' "${GPU_INVENTORY_LINES[@]}")"
 
 step "Verifying nvidia-open (${SUPPORTED_VERSIONS_CSV})"
 [[ ${#SUPPORTED_VERSIONS[@]} -gt 0 ]] || die "No supported versions listed in driver/VERSION"
-for required_command in find mktemp modinfo od readelf readlink sha256sum; do
+for required_command in find ldconfig mktemp modinfo od readelf readlink sha256sum; do
     command -v "${required_command}" &>/dev/null || \
         die "${required_command} is required for driver and firmware verification"
 done
@@ -282,24 +282,19 @@ version_supported() {
     return 1
 }
 
-detected=""
+running_version=""
 if [[ -r /proc/driver/nvidia/version ]]; then
-    detected="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version | head -1 || true)"
-fi
-if [[ -z "${detected}" ]] && command -v nvidia-smi &>/dev/null; then
-    smi_version="$(timeout --signal=TERM --kill-after=2s 10s \
-        nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | \
-        head -1 | tr -d '[:space:]' || true)"
-    [[ "${smi_version}" =~ ^[0-9]+(\.[0-9]+)+$ ]] && detected="${smi_version}"
-fi
-if [[ -z "${detected}" ]]; then
-    detected="$(modinfo -k "$(uname -r)" -F version nvidia 2>/dev/null | \
-        head -1 | tr -d '[:space:]' || true)"
+    running_version="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version | head -1 || true)"
 fi
 
-[[ -n "${detected}" ]] || die "Could not detect an installed NVIDIA driver. Install nvidia-open ${SUPPORTED_VERSIONS_CSV} first."
+detected="$(installed_nvidia_userspace_version)" || \
+    die "Could not identify a coherent installed NVIDIA userspace version. Repair the NVIDIA packages and linker cache first."
 version_supported "${detected}" || die "Installed driver is ${detected}, but cmpunlocker requires one of: ${SUPPORTED_VERSIONS_CSV}."
-ok "NVIDIA driver ${detected} is supported"
+ok "Installed NVIDIA userspace ${detected} is supported; targeting matching modules and firmware"
+if [[ -n "${running_version}" && "${running_version}" != "${detected}" ]]; then
+    warn "Running NVIDIA module is ${running_version}; building for installed userspace ${detected}"
+    warn "The running driver will remain unchanged until the required full power-off/power-on transition"
+fi
 if [[ "${TEN_GB_TARGET}" == "80gb" && "${detected}" != "610.43.02" ]]; then
     die "Experimental 80GB is currently release-gated to nvidia-open 610.43.02; use the 40GB default with ${detected}"
 fi

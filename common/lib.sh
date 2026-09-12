@@ -11,6 +11,36 @@ warn() { echo -e "${YELLOW}!${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; }
 die()  { err "$*"; exit 1; }
 
+installed_nvidia_userspace_version() {
+    local cache path resolved candidate version=""
+    cache="$(ldconfig -p 2>/dev/null)" || {
+        err "Cannot read the dynamic linker cache with ldconfig"
+        return 1
+    }
+    while IFS= read -r path; do
+        resolved="$(readlink -e -- "${path}")" || {
+            err "Installed NVML library is missing: ${path}"
+            return 1
+        }
+        if [[ "${resolved##*/}" =~ ^libnvidia-ml\.so\.([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            candidate="${BASH_REMATCH[1]}"
+        else
+            err "Cannot determine the installed NVML version from ${resolved}"
+            return 1
+        fi
+        if [[ -n "${version}" && "${version}" != "${candidate}" ]]; then
+            err "Conflicting installed NVML versions: ${version} and ${candidate}"
+            return 1
+        fi
+        version="${candidate}"
+    done < <(awk '$1 == "libnvidia-ml.so.1" && $(NF-1) == "=>" {print $NF}' <<< "${cache}")
+    [[ -n "${version}" ]] || {
+        err "No installed libnvidia-ml.so.1 found in the dynamic linker cache"
+        return 1
+    }
+    printf '%s\n' "${version}"
+}
+
 # Return 0 when a module contains a cmpunlocker fingerprint, 1 when a fully
 # readable/decompressible module does not, and 2 when its contents cannot be
 # inspected.  Callers must treat 0 and 2 as unsafe stock candidates.
