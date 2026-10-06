@@ -82,6 +82,8 @@ that on multi-GPU systems; apply the optional host-kernel patches in
 `kernel-patches/` (`install.sh` does not; 6.8 uses `linux-6.8/`). The
 installer adds `pci=realloc pci=hpmmioprefsize=2T` when P2P is enabled.
 `nvidia-smi topo -p2p` reporting OK is not proof of working transfers.
+With GPUs behind PCIe switches, multi-GPU P2P also needs ACS redirect off and
+`NCCL_P2P_LEVEL=SYS`; see [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 The driver changes both memory geometry and firmware-protected memory ranges.
 Do not hot-reload the NVIDIA modules or rely on a warm reboot. Shut the machine

@@ -37,6 +37,18 @@ BAR1 on every GPU is required; the optional host-kernel patches in
 reported only for pairs whose static BAR1 mapping succeeded; still verify with
 a real peer copy after reboot.
 
+With two or more GPUs behind one PCIe switch, multi-GPU P2P also needs ACS
+redirect off. Linux turns it on whenever an IOMMU driver is active, also with
+`iommu=pt`, and peer traffic between GPUs on one switch then goes up to the
+root complex. On 8 GPUs, two per switch, an NCCL ring drops to 0.47 GB/s,
+against 6.38 GB/s with redirect off. Clear it at runtime on the bridges above
+the GPUs with
+[`acs-redir.sh`](https://github.com/WU-CVGL/cluster-setup/blob/main/scripts/gpu-p2p/acs-redir.sh),
+only with `iommu=pt` and while no GPU is assigned to a VM, and set
+`NCCL_P2P_LEVEL=SYS` so NCCL uses P2P across root ports too. See
+[DEBUGGING.md](DEBUGGING.md#multi-gpu-p2p-rings-are-slow-behind-pcie-switches)
+and [GPU P2P on GeForce and CMP](https://github.com/WU-CVGL/cluster-setup/blob/main/docs/05_GPU_P2P_GeForce_and_CMP.md).
+
 ECC (DRAM and SRAM) is on by default. Pass `--no-ecc` to leave it off.
 `nvidia-smi` reports ECC as enabled with zero errors whenever the ECC patches
 are built in; that report is synthetic and does not show whether ECC works.

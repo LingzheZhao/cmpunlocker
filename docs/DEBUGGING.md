@@ -24,14 +24,71 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
   every GPU (`sudo dmesg | grep 'CMP BAR1'` / `lspci -vv` Region 1).
 - Driver-time BAR1 resize cannot grow parent bridge windows. Apply the patches
   in `kernel-patches/` and reboot.
+- Check the static BAR1 map with `sudo dmesg | grep CMPUNLOCK_BAR1P2P`. A good
+  boot shows `static BAR1 mapped offset 0x0` with the full FB size on every
+  GPU, and no `clamping`, `mapping failed` or `BAR1 P2P unavailable` line.
+- On CMP 170HX the BAR1 P2P type is set in `kbusInitRegistryOverrides`
+  (KernelBus construct), not in `_kbifInitRegistryOverrides`. KernelBif is
+  built before the PCI device ID is read, so a device-ID test there never
+  matches. If the type stays MAILBOX, RM reserves the P2P mailbox at the
+  bottom of BAR1. That moves the static map to offset 512 MiB (`0x20000000`),
+  where the client FB no longer fits (`clamping`), and disables the BAR1 P2P
+  caps, so every pair reports P2P not supported.
+- RM, nv_gpu_ops and UVM add the static offset themselves. Offset 0 is about
+  covering all of FB, not about address arithmetic.
 - Do not add `RMForceStaticBar1` or `RMPcieP2PType` to
   `NVreg_RegistryDwords`. GSP 610.43.02 returns `NV_ERR_INVALID_REGISTRY_KEY`
-  and leaves WPR2 up; BAR1 P2P type is forced in the driver for CMP IDs.
+  and leaves WPR2 up. The driver sets both for CMP IDs; a valid
+  `RMForceStaticBar1` value also skips that code, so the P2P type stays
+  MAILBOX.
 - After that failure the card needs a cold power-off, not `reboot`.
 - ACS redirect on a switch (`ReqRedir+`) forces peer traffic up to the root
-  complex. Check `lspci -vv | grep ACSCtl`.
+  complex. Check `lspci -vv | grep ACSCtl`, and see the next section.
 - Do not set `NVreg_RegistryDwords="ForceP2P=0x11"` and do not unload/reload
   the nvidia module on a live system.
+
+---
+
+## Multi-GPU P2P rings are slow behind PCIe switches
+
+- Linux turns on ACS Request and Completion Redirect on the root ports and
+  switch ports whenever an IOMMU driver is active, also with `iommu=pt`.
+  `sudo lspci -vv | grep ACSCtl` then shows `ReqRedir+ CmpltRedir+`.
+- With redirect on, P2P between two GPUs behind one switch goes up to the root
+  complex and back down the same uplink. A pair still runs at full speed, but
+  rings through two GPUs on one switch slow down, and the 8-GPU ring
+  collapses.
+- Measured on 8 GPUs, two behind each of four PCIe switches, each switch on its
+  own root port of one EPYC 7J13, Gen2 x16. NCCL `all_reduce`, 1 GiB, bus
+  bandwidth in GB/s, median of 3; the P2P columns use `NCCL_P2P_LEVEL=SYS`:
+
+  | GPUs | no P2P (SHM) | P2P, redirect on | P2P, redirect off |
+  |---|---|---|---|
+  | 2, one switch | 1.70 | 6.22 | 6.29 |
+  | 4, two switches | 1.93 | 4.29 | 6.36 |
+  | 4, one per switch | 4.19 | 6.33 | 6.34 |
+  | 8 | 2.17 | 0.47 | 6.38 |
+
+- Clear the redirect bits at runtime on the bridges above the GPUs with
+  [`acs-redir.sh`](https://github.com/WU-CVGL/cluster-setup/blob/main/scripts/gpu-p2p/acs-redir.sh)
+  (`status`, `off`, `restore`), run at boot from a systemd oneshot. A reboot
+  restores the kernel's defaults.
+- Use this only with `iommu=pt`. With a translating IOMMU, peer addresses are
+  IOVAs, and a switch would route them without translation.
+- Use it only while no GPU is assigned to a VM. With redirect off, a GPU in a
+  VM reaches the other GPUs without going through the IOMMU. `install.sh` arms
+  the cards for passthrough by default; restore the redirect before assigning
+  one to a VM.
+- `pci=disable_acs_redir=` does the same at boot, but it matches bridges by PCI
+  ID, so it also hits every other bridge with that ID, such as the root ports
+  of NICs and NVMe drives. When the root ports and switch ports have different
+  IDs, the value is a `;`-separated list, and GRUB's generated `linux` line
+  cuts it at the first `;`, so the kernel gets only the first ID.
+- NCCL's default keeps SHM between GPUs on different root ports. Set
+  `NCCL_P2P_LEVEL=SYS` (for example in `/etc/nccl.conf`, mounted read-only
+  into containers) to use P2P there too.
+- Setup, the boot unit and the full measurements:
+  [GPU P2P on GeForce and CMP](https://github.com/WU-CVGL/cluster-setup/blob/main/docs/05_GPU_P2P_GeForce_and_CMP.md).
 
 ---
 
@@ -49,6 +106,19 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
 - Confirm IOMMU passthrough mode is enabled. Depending on your operating system, enabling IOMMU passthrough can vary.
 
 - If this still persists, refer to the Discord protocol at the end of the document.
+
+---
+
+## A rebuilt nvidia.ko shows the same srcversion
+
+- `modinfo -F srcversion` hashes only the sources built under `kernel-open/`.
+  The RM core (`src/nvidia`), where most patches here apply, is linked in as
+  the binary object `nv-kernel.o`, so builds that differ there report the same
+  srcversion. Three different cmpunlocker builds on one host reported the same
+  srcversion while their `nvidia.ko` hashes differed.
+- To tell builds apart, compare
+  `sha256sum /lib/modules/$(uname -r)/updates/cmpunlocker/nvidia.ko`, and check
+  the boot log for the lines the new patches add.
 
 ---
 
