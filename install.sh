@@ -12,17 +12,22 @@ PROFILE_OVERRIDE=""
 CONFIGURE_IOMMU=1
 CONFIGURE_GEN2_SERVICE=1
 ENABLE_P2P=1
+ENABLE_ECC=1
+CONFIGURE_PASSTHROUGH=1
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
         --p2p) ENABLE_P2P=1 ;;
         --no-p2p) ENABLE_P2P=0 ;;
+        --no-ecc) ENABLE_ECC=0 ;;
         --no-iommu) CONFIGURE_IOMMU=0 ;;
         --no-gen2-service) CONFIGURE_GEN2_SERVICE=0 ;;
+        --no-passthrough) CONFIGURE_PASSTHROUGH=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-p2p] [--no-iommu] [--no-gen2-service]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-p2p] [--no-ecc] [--no-iommu]
+                        [--no-gen2-service] [--no-passthrough]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
@@ -32,9 +37,15 @@ Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-p2p] [--no-iommu] [--no-gen2
                   up from a normal boot. nvidia-smi topo -p2p is not proof —
                   verify with a real peer copy.
   --p2p           Explicitly enable BAR1 P2P (the default)
+  --no-ecc        Leave out the ECC (DRAM/SRAM) patches. ECC is on by default;
+                  nvidia-smi reports ECC as enabled whenever they are built in.
   --no-iommu      Do not add IOMMU passthrough kernel parameters
   --no-gen2-service
                   Do not install the early-boot PCIe Gen2 retrain service
+  --no-passthrough
+                  Do not set the cards up for VM passthrough. By default the
+                  unlock is made to survive being handed to vfio-pci, so a VM
+                  sees an unlocked card with only a stock NVIDIA driver in it
 
 By default the installer appends intel_iommu=on / amd_iommu=on plus iommu=pt to
 the kernel command line so the IOMMU runs in passthrough mode. This takes effect
@@ -61,7 +72,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 source "${SCRIPT_DIR}/common/lib.sh"
 
 banner
-step_init 6
+step_init 7
 
 step "Verifying root privileges"
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ./install.sh"
@@ -185,7 +196,8 @@ for i in "${!GPU_BDFS[@]}"; do
     GPU_INVENTORY_LINES+=("${GPU_BDFS[$i]} ${GPU_DEVIDS[$i]} ${GPU_PROFILES[$i]} ${GPU_EXPECTED[$i]}")
 done
 export CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}"
-export CMPUNLOCKER_GPU_INVENTORY="$(printf '%s\n' "${GPU_INVENTORY_LINES[@]}")"
+CMPUNLOCKER_GPU_INVENTORY="$(printf '%s\n' "${GPU_INVENTORY_LINES[@]}")"
+export CMPUNLOCKER_GPU_INVENTORY
 
 step "Verifying nvidia-open (${SUPPORTED_VERSIONS_CSV})"
 [[ ${#SUPPORTED_VERSIONS[@]} -gt 0 ]] || die "No supported versions listed in driver/VERSION"
@@ -245,8 +257,23 @@ CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
 CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
 CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}" \
+CMPUNLOCKER_ENABLE_ECC="${ENABLE_ECC}" \
     "${SCRIPT_DIR}/driver/build.sh"
 ok "Patched modules installed (profile ${CARD_PROFILE})"
+
+step "Setting up VM passthrough"
+PASSTHROUGH_STATUS="skipped"
+if (( CONFIGURE_PASSTHROUGH == 1 )); then
+    chmod +x "${SCRIPT_DIR}/tools/passthrough-setup.sh"
+    if CMPUNLOCKER_KVER="$(uname -r)" "${SCRIPT_DIR}/tools/passthrough-setup.sh"; then
+        PASSTHROUGH_STATUS="armed"
+    else
+        PASSTHROUGH_STATUS="failed"
+        warn "passthrough setup failed; the unlock still works on this host"
+    fi
+else
+    warn "--no-passthrough given; cards are not prepared for VM passthrough"
+fi
 
 info "Configuring PCIe Gen2"
 # GSP 610.43.02 rejects RMForceStaticBar1 / RMPcieP2PType in
@@ -462,6 +489,12 @@ if (( ENABLE_P2P == 1 )); then
 else
     echo "P2P:     off"
 fi
+if (( ENABLE_ECC == 1 )); then
+    echo "ECC:     patches built in (nvidia-smi ECC status is synthetic)"
+else
+    echo "ECC:     off"
+fi
+echo "Passthrough: ${PASSTHROUGH_STATUS}"
 if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
     echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"
 else

@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="cmpunlocker"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INSTALL_DIR="/opt/cmpunlocker"
+PASSTHROUGH_LIB="/usr/local/lib/cmpunlocker"
+mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_DIR}/driver/VERSION" 2>/dev/null || true)
 
 source "${SCRIPT_DIR}/common/lib.sh"
 
@@ -17,6 +19,8 @@ if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Leaves running NVIDIA modules untouched until a required cold power-off"
     echo "  - Removes cmpretrain service / modprobe Gen2 and P2P helpers"
+    echo "  - Removes VM passthrough helpers (service, udev rule, vfio modprobe conf)"
+    echo "  - Rebuilds the stock nvidia DKMS modules that install.sh removed"
     echo "  - Restores the pre-install kernel command line (reverts IOMMU changes)"
     echo ""
     echo "Run: sudo ./remove.sh --yes"
@@ -96,8 +100,25 @@ rm -f /etc/modprobe.d/cmp-pcie-gen2.conf
 systemctl disable --now gen2.service 2>/dev/null || true
 systemctl reset-failed gen2.service 2>/dev/null || true
 rm -f /etc/systemd/system/gen2.service /usr/local/sbin/gen2-hammer
-systemctl daemon-reload 2>/dev/null || true
 ok "Removed PCIe Gen2 helpers"
+
+info "Removing VM passthrough helpers"
+systemctl disable --now cmpunlocker-passthrough.service 2>/dev/null || true
+systemctl reset-failed cmpunlocker-passthrough.service 2>/dev/null || true
+rm -f /etc/systemd/system/cmpunlocker-passthrough.service \
+      /etc/udev/rules.d/99-cmpunlocker-passthrough.rules \
+      /etc/modprobe.d/cmpunlocker-vfio.conf
+rm -rf "${PASSTHROUGH_LIB}"
+udevadm control --reload-rules 2>/dev/null || true
+if grep -q '^cmp_no_bus_reset ' /proc/modules; then
+    rmmod cmp_no_bus_reset 2>/dev/null || true
+fi
+mapfile -t cmp_bdfs < <(lspci -Dn 2>/dev/null | awk '/10de:20c2|10de:2082/{print $1}')
+for bdf in "${cmp_bdfs[@]}"; do
+    printf 'default' > "/sys/bus/pci/devices/${bdf}/reset_method" 2>/dev/null || true
+done
+systemctl daemon-reload 2>/dev/null || true
+ok "Removed VM passthrough helpers"
 
 info "Restoring IOMMU kernel command line"
 iommu_restored=0
@@ -125,9 +146,32 @@ else
     warn "No IOMMU config backup found — kernel command line left as-is"
 fi
 
-step "Removing patched modules and legacy files"
+step "Removing patched modules and restoring stock NVIDIA modules"
+restore_stock_modules() {
+    local kernel="$1" ver
+    if modprobe -n -q -S "${kernel}" nvidia 2>/dev/null; then
+        ok "Stock nvidia module present for kernel ${kernel}: $(modinfo -n -k "${kernel}" nvidia 2>/dev/null || true)"
+        return 0
+    fi
+    if ! command -v dkms &>/dev/null; then
+        warn "No nvidia module for kernel ${kernel} and dkms is not installed — reinstall your distro's nvidia driver package"
+        return 0
+    fi
+    for ver in "${SUPPORTED_VERSIONS[@]}"; do
+        [[ -f "/usr/src/nvidia-${ver}/dkms.conf" ]] || continue
+        info "Rebuilding stock nvidia ${ver} DKMS modules for kernel ${kernel} (install.sh removed them)..."
+        if dkms install "nvidia/${ver}" -k "${kernel}"; then
+            ok "Stock nvidia ${ver} modules restored for kernel ${kernel}"
+            return 0
+        fi
+        warn "dkms install nvidia/${ver} failed for kernel ${kernel}"
+    done
+    warn "No stock nvidia DKMS source found for kernel ${kernel} — reinstall your distro's nvidia driver package"
+    return 0
+}
+
 mod_removed=0
-kernels_touched=()
+kernels=("$(uname -r)")
 shopt -s nullglob
 for mod_dir in /lib/modules/*/updates/cmpunlocker; do
     if [[ -d "${mod_dir}" ]]; then
@@ -137,21 +181,25 @@ for mod_dir in /lib/modules/*/updates/cmpunlocker; do
             die "depmod failed for kernel ${kernel} after patched modules were removed"
         ok "Removed patched modules for kernel ${kernel}"
         mod_removed=$((mod_removed + 1))
-        kernels_touched+=("${kernel}")
+        [[ " ${kernels[*]} " == *" ${kernel} "* ]] || kernels+=("${kernel}")
     fi
 done
 [[ "${mod_removed}" -gt 0 ]] || warn "No patched kernel modules found"
 
-if [[ ${#kernels_touched[@]} -gt 0 ]]; then
+for kernel in "${kernels[@]}"; do
+    restore_stock_modules "${kernel}"
+done
+
+if [[ ${#kernels[@]} -gt 0 ]]; then
     info "Rebuilding initramfs so stock modules are packed again..."
-    initramfs_manual_recovery="Patched modules are already removed for kernel(s): ${kernels_touched[*]}. Manually rebuild each affected initramfs before rebooting."
+    initramfs_manual_recovery="Patched modules are already removed for kernel(s): ${kernels[*]}. Manually rebuild each affected initramfs before rebooting."
     if command -v update-initramfs &>/dev/null; then
-        for kernel in "${kernels_touched[@]}"; do
+        for kernel in "${kernels[@]}"; do
             update-initramfs -u -k "${kernel}" || \
                 die "update-initramfs failed for ${kernel}. ${initramfs_manual_recovery}"
         done
     elif command -v dracut &>/dev/null; then
-        for kernel in "${kernels_touched[@]}"; do
+        for kernel in "${kernels[@]}"; do
             dracut --force --kver "${kernel}" || \
                 die "dracut failed for ${kernel}. ${initramfs_manual_recovery}"
         done
@@ -162,7 +210,11 @@ if [[ ${#kernels_touched[@]} -gt 0 ]]; then
     fi
     ok "Rebuilt initramfs with the stock module selection"
 
-    for kernel in "${kernels_touched[@]}"; do
+    for kernel in "${kernels[@]}"; do
+        if [[ "${kernel}" != "$(uname -r)" ]] && ! modinfo -k "${kernel}" -n nvidia &>/dev/null; then
+            warn "Kernel ${kernel} has no stock nvidia module; reinstall the driver package before booting it"
+            continue
+        fi
         modprobe_plan="$(modprobe --set-version "${kernel}" -n -v nvidia 2>&1)" || {
             printf '%s\n' "${modprobe_plan}" >&2
             die "Could not resolve the stock nvidia module for kernel ${kernel}"
@@ -191,6 +243,7 @@ if [[ ${#kernels_touched[@]} -gt 0 ]]; then
         ok "Kernel ${kernel} resolves nvidia to ${stock_module_path}"
     done
 fi
+ok "initramfs rebuild attempted"
 
 for gsp in /lib/firmware/nvidia/*/gsp_tu10x.bin; do
     rm -f \

@@ -85,6 +85,8 @@ version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (
 command -v python3 &>/dev/null || die "python3 is required to apply the card memory profile"
 select_kernel_cc
 info "Using ${KERNEL_CC} to build modules for kernel ${KVER}"
+python3 -c "import yaml" 2>/dev/null || die "python3 PyYAML is required to read common/constants.yaml (apt install python3-yaml)"
+command -v sha256sum &>/dev/null || die "sha256sum is required"
 info "Building against open-gpu-kernel-modules ${VERSION}"
 
 PATCH_ORDER=(
@@ -99,6 +101,10 @@ PATCH_ORDER=(
     name-string.patch
     bar1-resize-unlock.patch
     sec2-payload-safety.patch
+    cmp-sku-mask.patch
+    ecc-enable.patch
+    ecc-fbpa-static.patch
+    ecc-reporting.patch
 )
 P2P_PATCH_ORDER=(
     p2p-bar1.patch
@@ -107,6 +113,22 @@ P2P_PATCH_ORDER=(
     p2p-caps-force.patch
     p2p-static-bar1-force.patch
 )
+ENABLE_ECC="${CMPUNLOCKER_ENABLE_ECC:-1}"
+case "${ENABLE_ECC}" in
+    0|"") ENABLE_ECC=0 ;;
+    1) ENABLE_ECC=1 ;;
+    *) die "CMPUNLOCKER_ENABLE_ECC must be 0 or 1 (got '${ENABLE_ECC}')" ;;
+esac
+if (( ENABLE_ECC == 0 )); then
+    kept=()
+    for name in "${PATCH_ORDER[@]}"; do
+        [[ "${name}" == ecc-*.patch ]] || kept+=("${name}")
+    done
+    PATCH_ORDER=("${kept[@]}")
+    info "ECC patches left out (CMPUNLOCKER_ENABLE_ECC=0)"
+else
+    info "ECC patches enabled"
+fi
 ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-1}"
 case "${ENABLE_P2P}" in
     0|"") ENABLE_P2P=0 ;;
@@ -127,34 +149,16 @@ for name in "${PATCH_ORDER[@]}"; do
 done
 
 PROFILE="${CMPUNLOCKER_CARD_PROFILE:-8gb}"
-SKIP_GEOMETRY_REWRITE=0
 case "${PROFILE}" in
-    8gb|8GB)
-        PROFILE="8gb"
-        CFG1="0x02779000"
-        LMR="0x0000020B"
-        FB_BYTES="0x0000001000000000"
-        UNLOCK_LABEL="64GB"
-        ;;
-    10gb|10GB)
-        PROFILE="10gb"
-        CFG1="0x02669000"
-        LMR="0x0000028A"
-        FB_BYTES="0x0000000A00000000"
-        UNLOCK_LABEL="40GB"
-        ;;
-    mixed|MIXED)
-        PROFILE="mixed"
-        CFG1="0x02779000"
-        LMR="0x0000020B"
-        FB_BYTES="0x0000001000000000"
-        UNLOCK_LABEL="mixed"
-        SKIP_GEOMETRY_REWRITE=1
-        ;;
-    *)
-        die "Unknown CMPUNLOCKER_CARD_PROFILE='${PROFILE}' (use 8gb, 10gb, or mixed)"
-        ;;
+    8GB) PROFILE="8gb" ;;
+    10GB) PROFILE="10gb" ;;
+    MIXED) PROFILE="mixed" ;;
 esac
+
+CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
+[[ -r "${CONSTANTS}" ]] || die "Missing ${CONSTANTS}"
+CONSTANTS_ENV="$(python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${PROFILE}")" || die "common/constants.yaml rejected (see error above)"
+eval "${CONSTANTS_ENV}"
 
 mkdir -p "${BUILD_ROOT}"
 

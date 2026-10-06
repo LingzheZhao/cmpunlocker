@@ -11,7 +11,7 @@
      PACKED_REGISTRY_TABLE *pRegTable;
 --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
-@@ -102,6 +102,304 @@
+@@ -102,6 +102,312 @@
  
  #include "crashcat/crashcat_report.h"
  
@@ -31,6 +31,14 @@
 + */
 +#define SEC2_POSTBL_TIMING_FB_REGION_SETUP_HEADROOM 6U
 +#define SEC2_POSTBL_TIMING_BUILD_FINGERPRINT       "cmpunlocker-safety-v4"
++
++#ifdef GSP_FW_WPR_META_V1_H_
++#define SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)      ((pKernelGsp)->pWprMetaV1)
++#define SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp) ((pKernelGsp)->pWprMetaV1Descriptor)
++#else
++#define SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)      ((pKernelGsp)->pWprMeta)
++#define SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp) ((pKernelGsp)->pWprMetaDescriptor)
++#endif
 +
 +NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
 +                                           NvU32 writeAddr, NvU32 writeValue);
@@ -316,7 +324,7 @@
  
  struct MIG_CI_UPDATE_CALLBACK_PARAMS
  {
-@@ -4813,6 +5094,16 @@
+@@ -4813,6 +5119,16 @@
      // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw));
  
@@ -333,7 +341,7 @@
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
          NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspPrepareScrubberImageIfNeeded(pGpu, pKernelGsp));
-@@ -4821,6 +5112,153 @@
+@@ -4821,6 +5137,183 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -341,6 +349,7 @@
 +    {
 +        NvU32 plmIdx, attempt;
 +        NV_STATUS plmStatus;
++        NvBool smReconfigPlmOpen = NV_TRUE;
 +
 +        static const struct { NvU32 addr; NvU32 value; const char *name; } plmTable[] = {
 +            { 0x001fa7ccU, 0xfffff0ffU, "WPR_CFG" },
@@ -352,6 +361,7 @@
 +            { 0x00088ff8U, 0xffffffffU, "XVE_C" },
 +            { 0x00823b00U, 0xffffffffU, "FEAT2" },
 +            { 0x008200fcU, 0xffffffffU, "OPT_PLM" },
++            { 0x008200d8U, 0xffffffffU, "RECONFIG_PLM" },
 +            { 0x0000c840U, 0xffffffffU, "PJTAG_PLM" },
 +            { 0x0000c848U, 0xffffffffU, "PJTAG_SEC_PLM" },
 +        };
@@ -362,7 +372,7 @@
 +                  "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
 +                  wpr2Lo, wpr2Hi);
 +
-+        for (plmIdx = 0; plmIdx < 11; plmIdx++)
++        for (plmIdx = 0; plmIdx < NV_ARRAY_ELEMENTS(plmTable); plmIdx++)
 +        {
 +            NvBool opened = NV_FALSE;
 +            for (attempt = 0; attempt < 2 && !opened; attempt++)
@@ -386,6 +396,15 @@
 +
 +                if (regVal == plmTable[plmIdx].value)
 +                    opened = NV_TRUE;
++            }
++            if (!opened && plmTable[plmIdx].addr == 0x008200d8U)
++            {
++                // RECONFIG_PLM only gates the SM reconfiguration below.
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: RECONFIG_PLM not opened (last status=0x%x); "
++                          "skipping SM-RECONFIG\n", plmStatus);
++                smReconfigPlmOpen = NV_FALSE;
++                continue;
 +            }
 +            if (!opened)
 +            {
@@ -462,6 +481,25 @@
 +                      devId);
 +        }
 +
++        if (smReconfigPlmOpen)
++        {
++            NvU32 gpc;
++            NvU32 gpcDisable = GPU_REG_RD32(pGpu, 0x00820350U);
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: SM-RECONFIG start OPT_GPC_DISABLE=0x%08x\n",
++                      gpcDisable);
++            for (gpc = 0; gpc < 8; gpc++)
++            {
++                NvU32 statBefore = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
++                NvU32 statAfter;
++                GPU_REG_WR32(pGpu, 0x00820a40U + gpc * 4U, 0x000000ffU);
++                statAfter = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: SM-RECONFIG GPC%u OVR<-0xff STATUS 0x%08x->0x%08x\n",
++                          gpc, statBefore, statAfter);
++            }
++        }
++
 +        plmStatus = kgspSec2PostblTimingRebuildStockSignature(pGpu, pKernelGsp);
 +        if (plmStatus != NV_OK)
 +        {
@@ -487,7 +525,7 @@
      // Release the API lock if relaxed locking for parallel init is enabled
      NvBool bRelaxedLocking = _kgspShouldRelaxGspInitLocking(pGpu);
      if (bRelaxedLocking)
-@@ -5164,6 +5602,13 @@
+@@ -5164,6 +5657,13 @@
          goto done;
      }
  
@@ -501,7 +539,7 @@
      NV_ASSERT_OK_OR_GOTO(status, kgspInitGspTraceCrashBuffer(pGpu, pKernelGsp), done);
  
      // Set PDB properties as per data from GSP.
-@@ -5662,6 +6107,84 @@
+@@ -5662,6 +6162,84 @@
      pKernelGsp->gspRmBootUcodeSize   = 0;
  }
  
@@ -586,7 +624,7 @@
  static NV_STATUS
  _kgspCreateSignatureMemdesc
  (
-@@ -5672,6 +6195,9 @@
+@@ -5672,6 +6250,9 @@
  {
      NV_STATUS status = NV_OK;
      NvU8 *pSignatureVa = NULL;
@@ -596,7 +634,7 @@
      NvU64 flags = MEMDESC_FLAGS_NONE;
  
      if (confComputeForceUnprotAlloc(pGpu))
-@@ -5682,7 +6208,7 @@
+@@ -5682,7 +6263,7 @@
      // NOTE: align to 256 because that's the alignment needed for Booter DMA
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
          memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
@@ -605,7 +643,7 @@
              NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
  
      memdescTagAlloc(status,
-@@ -5694,8 +6220,48 @@
+@@ -5694,8 +6275,48 @@
          (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
          fail_alloc);
  
@@ -656,7 +694,7 @@
  
      memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
      pSignatureVa = NULL;
-@@ -5709,6 +6275,69 @@
+@@ -5709,6 +6330,69 @@
      memdescDestroy(pKernelGsp->pSignatureMemdesc);
      pKernelGsp->pSignatureMemdesc = NULL;
  
