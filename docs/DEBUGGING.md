@@ -72,22 +72,27 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
 
 - Clear the redirect bits at runtime on the bridges above the GPUs with
   [`acs-redir.sh`](https://github.com/WU-CVGL/cluster-setup/blob/main/scripts/gpu-p2p/acs-redir.sh)
-  (`status`, `off`, `restore`), run at boot from a systemd oneshot. A reboot
-  restores the kernel's defaults.
+  (`status`, `off`, `restore`). A reboot restores the kernel's defaults;
+  cluster-setup's `gpu-acs-redir-off.service`
+  ([At every boot](https://github.com/WU-CVGL/cluster-setup/blob/main/scripts/gpu-p2p/README.md#at-every-boot))
+  runs `off` at every boot.
 - Use this only with `iommu=pt`. With a translating IOMMU, peer addresses are
   IOVAs, and a switch would route them without translation.
 - Use it only while no GPU is assigned to a VM. With redirect off, a GPU in a
   VM reaches the other GPUs without going through the IOMMU. `install.sh` arms
   the cards for passthrough by default; restore the redirect before assigning
   one to a VM.
-- `pci=disable_acs_redir=` does the same at boot, but it matches bridges by PCI
-  ID, so it also hits every other bridge with that ID, such as the root ports
-  of NICs and NVMe drives. When the root ports and switch ports have different
-  IDs, the value is a `;`-separated list, and GRUB's generated `linux` line
-  cuts it at the first `;`, so the kernel gets only the first ID.
-- NCCL's default keeps SHM between GPUs on different root ports. Set
+- `pci=disable_acs_redir=` does the same at boot. Matched by PCI ID, it also
+  hits every other bridge with that ID, such as the root ports of NICs and
+  NVMe drives; matched by bus address, it needs one entry per bridge, tied to
+  bus numbers. Several entries form a `;`-separated list, and GRUB's generated
+  `linux` line is unquoted, so GRUB ends the `linux` command at the first `;`:
+  the kernel gets the first entry and none of the parameters after it.
+- NCCL's default (2.25.1 here) uses P2P for a pair, but SHM between root
+  ports for some or all connections in groups of four and eight GPUs. Set
   `NCCL_P2P_LEVEL=SYS` (for example in `/etc/nccl.conf`, mounted read-only
-  into containers) to use P2P there too.
+  into containers) to use P2P there too. Keep it together with redirect off:
+  with redirect on, it gives the 0.47 GB/s above.
 - Setup, the boot unit and the full measurements:
   [GPU P2P on GeForce and CMP](https://github.com/WU-CVGL/cluster-setup/blob/main/docs/05_GPU_P2P_GeForce_and_CMP.md).
 
