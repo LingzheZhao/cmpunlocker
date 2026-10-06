@@ -38,12 +38,13 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
   covering all of FB, not about address arithmetic.
 - Do not add `RMForceStaticBar1` or `RMPcieP2PType` to
   `NVreg_RegistryDwords`. GSP 610.43.02 returns `NV_ERR_INVALID_REGISTRY_KEY`
-  and leaves WPR2 up. The driver sets both for CMP IDs; a valid
-  `RMForceStaticBar1` value also skips that code, so the P2P type stays
-  MAILBOX.
+  and leaves WPR2 up. For CMP IDs the driver itself sets static BAR1 to
+  ENABLE and the P2P type to BAR1; a valid `RMForceStaticBar1` value skips
+  that code, so the P2P type stays MAILBOX.
 - After that failure the card needs a cold power-off, not `reboot`.
 - ACS redirect on a switch (`ReqRedir+`) forces peer traffic up to the root
-  complex. Check `lspci -vv | grep ACSCtl`, and see the next section.
+  complex. Check `lspci -vv | grep ACSCtl`, and see
+  [Multi-GPU P2P rings are slow behind PCIe switches](#multi-gpu-p2p-rings-are-slow-behind-pcie-switches).
 - Do not set `NVreg_RegistryDwords="ForceP2P=0x11"` and do not unload/reload
   the nvidia module on a live system.
 
@@ -62,7 +63,7 @@ Before you go asking in the Discord for help, here is a FAQ you should take a lo
   own root port of one EPYC 7J13, Gen2 x16. NCCL `all_reduce`, 1 GiB, bus
   bandwidth in GB/s, median of 3; the P2P columns use `NCCL_P2P_LEVEL=SYS`:
 
-  | GPUs | no P2P (SHM) | P2P, redirect on | P2P, redirect off |
+  | GPUs | build without P2P (SHM) | P2P, redirect on | P2P, redirect off |
   |---|---|---|---|
   | 2, one switch | 1.70 | 6.22 | 6.29 |
   | 4, two switches | 1.93 | 4.29 | 6.36 |
