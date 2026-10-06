@@ -1,0 +1,111 @@
+--- a/src/nvidia/src/kernel/gpu/bus/kern_bus.c
++++ b/src/nvidia/src/kernel/gpu/bus/kern_bus.c
+@@ -194,7 +194,26 @@
+     }
+     else
+     {
+-        pKernelBus->staticBar1ForceType = NV_REG_STR_RM_FORCE_STATIC_BAR1_AUTO;
++        NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;
++
++        //
++        // cmpunlocker P2P: AUTO refuses static BAR1 when BAR1 size == FB size
++        // because it also budgets USERD / doorbell / mailbox. ENABLE only
++        // requires BAR1 >= client-visible FB, which a 64GB BAR1 satisfies.
++        // Do not put RMForceStaticBar1 in NVreg_RegistryDwords — GSP rejects
++        // unknown keys with NV_ERR_INVALID_REGISTRY_KEY and leaves WPR2 up.
++        //
++        if ((cmpDevId == 0x20C2) || (cmpDevId == 0x2082))
++        {
++            pKernelBus->staticBar1ForceType = NV_REG_STR_RM_FORCE_STATIC_BAR1_ENABLE;
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMPUNLOCK_BAR1P2P: forcing static BAR1 ENABLE (devId=0x%x)\n",
++                      cmpDevId);
++        }
++        else
++        {
++            pKernelBus->staticBar1ForceType = NV_REG_STR_RM_FORCE_STATIC_BAR1_AUTO;
++        }
+     }
+ 
+     //
+--- a/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
+@@ -552,6 +552,41 @@
+                                 RM_PAGE_SIZE_2M);
+ 
+     //
++    // The 512MB-aligned BAR1 offset leaves a hole at the bottom of the
++    // aperture (console / leftover mailbox). ENABLE only checks BAR1 >= FB,
++    // so offset + FB can still overflow a 64GB BAR1 (seen as
++    // NV_ERR_INVALID_ARGUMENT from dmaAllocMapping, then RmInitAdapter
++    // fails). Clamp the identity map to the remaining VA.
++    //
++    {
++        NvU64 bar1VaLimit = pKernelBus->bar1[gfid].mappableLength;
++        NvU64 available;
++
++        if (bar1VaLimit <= bar1Offset)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMPUNLOCK_BAR1P2P: BAR1 offset 0x%llx beyond mappable 0x%llx\n",
++                      bar1Offset, bar1VaLimit);
++            return NV_ERR_INSUFFICIENT_RESOURCES;
++        }
++
++        available = RM_ALIGN_DOWN(bar1VaLimit - bar1Offset, RM_PAGE_SIZE_2M);
++        if (bar1MapSize > available)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMPUNLOCK_BAR1P2P: clamping static BAR1 size 0x%llx -> 0x%llx "
++                      "(offset 0x%llx mappable 0x%llx)\n",
++                      bar1MapSize, available, bar1Offset, bar1VaLimit);
++            bar1MapSize = available;
++        }
++
++        if (bar1MapSize == 0)
++        {
++            return NV_ERR_INSUFFICIENT_RESOURCES;
++        }
++    }
++
++    //
+     // The static mapping is not backed by an allocated physical FB.
+     // Here RM describes the memory for the static mapping.
+     //
+@@ -608,8 +643,9 @@
+     pKernelBus->bar1[gfid].staticBar1.startOffset = bar1Offset;
+     pKernelBus->bar1[gfid].staticBar1.size = bar1MapSize;
+ 
+-    NV_PRINTF(LEVEL_INFO, "Static bar1 mapped offset 0x%llx size 0x%llx\n",
+-                           bar1Offset, bar1MapSize);
++    NV_PRINTF(LEVEL_ERROR,
++              "CMPUNLOCK_BAR1P2P: static BAR1 mapped offset 0x%llx size 0x%llx busAddr 0x%llx\n",
++              bar1Offset, bar1MapSize, bar1BusAddr);
+ 
+     return NV_OK;
+ 
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -1196,9 +1196,19 @@
+         //
+         NvU64 bar1Offset = NV_ALIGN_UP(consoleSize + pKernelBus->p2pPcie.writeMailboxTotalSize, RM_PAGE_SIZE_512M);
+         // Enable the static BAR1 mapping for the BAR1 P2P
+-        NV_ASSERT_OK_OR_GOTO(rmStatus,
+-                             kbusEnableStaticBar1Mapping_HAL(pGpu, pKernelBus, gfid, bar1Offset),
+-                             kbusInitBar1_failed);
++        rmStatus = kbusEnableStaticBar1Mapping_HAL(pGpu, pKernelBus, gfid, bar1Offset);
++        if (rmStatus != NV_OK)
++        {
++            //
++            // cmpunlocker P2P: do not take the GPU down if the identity map
++            // does not fit. Memory unlock still works; BAR1 P2P will not.
++            //
++            NV_PRINTF(LEVEL_ERROR,
++                      "CMPUNLOCK_BAR1P2P: static BAR1 mapping failed status=0x%x "
++                      "offset=0x%llx; continuing without it\n",
++                      rmStatus, bar1Offset);
++            rmStatus = NV_OK;
++        }
+     }
+ 
+     //

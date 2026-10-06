@@ -105,6 +105,7 @@ P2P_PATCH_ORDER=(
     p2p-skip-mailbox-peer-preinit.patch
     p2p-bar1-readcap-override.patch
     p2p-caps-force.patch
+    p2p-static-bar1-force.patch
 )
 ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-1}"
 case "${ENABLE_P2P}" in
