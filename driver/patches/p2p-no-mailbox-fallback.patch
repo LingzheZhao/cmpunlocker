@@ -1,0 +1,61 @@
+--- a/src/nvidia/src/kernel/platform/p2p/p2p_caps.c
++++ b/src/nvidia/src/kernel/platform/p2p/p2p_caps.c
+@@ -803,6 +803,27 @@
+     return NV_OK;
+ }
+ 
++//
++// CMPUNLOCK_BAR1P2P: TRUE when any GPU in the mask is a CMP 170HX
++// (10de:20c2 or 10de:2082), whose P2P caps the cmpunlocker patches force OK.
++//
++static NvBool
++_p2pCapsMaskHasCmp170hx(NvU32 gpuMask)
++{
++    NvU32 gpuInstance = 0;
++    OBJGPU *pGpu;
++
++    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++    {
++        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++
++        if (devId == 0x20C2 || devId == 0x2082)
++            return NV_TRUE;
++    }
++
++    return NV_FALSE;
++}
++
+ NV_STATUS
+ p2pGetCapsStatus
+ (
+@@ -944,6 +965,30 @@
+                 *pP2PAtomicsCapStatus = bar1P2PAtomicsCapStatus;
+                 *pConnectivity = P2P_CONNECTIVITY_PCIE_BAR1;
+             }
++            else if (_p2pCapsMaskHasCmp170hx(gpuMask))
++            {
++                //
++                // CMPUNLOCK_BAR1P2P: the caps were forced OK for BAR1 P2P. If
++                // the BAR1 path is not available for this mask (static BAR1
++                // missing on a GPU, or a loopback mask), never fall back to the
++                // mailbox (PCIE_PROPRIETARY) path, which returns wrong data on
++                // CMP 170HX. Report P2P as not supported instead.
++                //
++                static NvU32 cmpNoFallbackLogs;
++
++                if (nvPopCount32(gpuMask) > 1 && cmpNoFallbackLogs < 16)
++                {
++                    cmpNoFallbackLogs++;
++                    NV_PRINTF(LEVEL_ERROR,
++                              "CMPUNLOCK_BAR1P2P: BAR1 P2P unavailable for gpuMask 0x%x; "
++                              "reporting P2P not supported (no mailbox fallback)\n",
++                              gpuMask);
++                }
++                *pP2PWriteCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
++                *pP2PReadCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
++                *pP2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
++                *pConnectivity = P2P_CONNECTIVITY_UNKNOWN;
++            }
+ 
+             return NV_OK;
+         }

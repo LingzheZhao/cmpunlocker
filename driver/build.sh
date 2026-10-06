@@ -112,6 +112,7 @@ P2P_PATCH_ORDER=(
     p2p-bar1-readcap-override.patch
     p2p-caps-force.patch
     p2p-static-bar1-force.patch
+    p2p-no-mailbox-fallback.patch
 )
 ENABLE_ECC="${CMPUNLOCKER_ENABLE_ECC:-1}"
 case "${ENABLE_ECC}" in
