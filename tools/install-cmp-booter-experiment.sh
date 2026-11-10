@@ -98,6 +98,16 @@ verify_resolution() {
     done
 }
 
+rebuild_module_index() (
+    umask 022
+    depmod -a "${KVER}"
+)
+
+rebuild_initramfs() (
+    umask 022
+    mkinitcpio -p linux
+)
+
 restore_snapshot() {
     local transaction="$1" restore_stage result=0
     printf 'Restoring snapshot: %s\n' "${transaction}"
@@ -117,8 +127,8 @@ restore_snapshot() {
     else
         rm -f -- "${DEPMOD_CONFIG}" || result=1
     fi
-    depmod -a "${KVER}" || result=1
-    if ! mkinitcpio -p linux; then
+    rebuild_module_index || result=1
+    if ! rebuild_initramfs; then
         printf 'Initramfs regeneration failed; restoring the saved image.\n' >&2
         cp -a -- "${transaction}/previous-initramfs-linux.img" "${INITRAMFS}" || result=1
     fi
@@ -152,7 +162,8 @@ fi
 umask 077
 exec 9>/run/lock/cmpunlocker.lock
 flock -n 9 || die "Another cmpunlocker operation is running"
-mkdir -p "${BACKUP_ROOT}" "$(dirname "${MODULE_DIR}")" /etc/depmod.d
+mkdir -p "${BACKUP_ROOT}"
+install -d -m 0755 "$(dirname "${MODULE_DIR}")" /etc/depmod.d
 transaction="$(mktemp -d "${BACKUP_ROOT}/booter-experiment.XXXXXX")"
 printf '%s\n' "${KVER}" > "${transaction}/kernel_version"
 if [[ -d "${MODULE_DIR}" && ! -L "${MODULE_DIR}" ]]; then
@@ -208,9 +219,9 @@ changed=1
 if [[ -d "${MODULE_DIR}" ]]; then mv -- "${MODULE_DIR}" "${old_move}"; fi
 mv -- "${stage}" "${MODULE_DIR}"
 install -m 0644 "${transaction}/experiment-depmod.conf" "${DEPMOD_CONFIG}"
-depmod -a "${KVER}"
+rebuild_module_index
 verify_resolution || die "Experimental module selection failed"
-mkinitcpio -p linux
+rebuild_initramfs
 verify_resolution || die "Experimental module selection changed during initramfs generation"
 complete=1
 printf 'Installed on disk. Running GPU modules were not reloaded.\n'
